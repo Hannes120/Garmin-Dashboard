@@ -489,7 +489,7 @@ def generate_dashboard(garmin_data: dict) -> str:
 
     # ── Schwimm-Warnung berechnen ─────────────────────────────────────────────
     last_swim  = metrics.get("last_swim", {})
-    swim_days_ago = last_swim.get("days_ago", 999) if last_swim else 999
+    swim_days_ago = (last_swim.get("days_ago") or 999) if last_swim else 999
     swim_warning = ""
     if swim_days_ago >= 14:
         swim_warning = f"🚨 KRITISCH: Letztes Schwimmen vor {swim_days_ago} Tagen! Bamberg in {next((e['days_left'] for e in events if 'triathlon' in e.get('type','')), '?')} Tagen."
