@@ -1,0 +1,39 @@
+name: Daily Garmin Dashboard
+
+on:
+  schedule:
+    # Jeden Tag um 07:00 Uhr CEST (= 05:00 UTC im Sommer / UTC+2)
+    - cron: '15 4 * * *'
+
+  # Manueller Start — für Tests direkt auf GitHub klicken
+  workflow_dispatch:
+
+jobs:
+  generate-dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Repository auschecken
+        uses: actions/checkout@v4
+
+      - name: Python 3.11 einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Abhängigkeiten installieren
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Dashboard generieren & per E-Mail senden
+        env:
+          GARMIN_EMAIL:       ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD:    ${{ secrets.GARMIN_PASSWORD }}
+          CLAUDE_API_KEY:     ${{ secrets.CLAUDE_API_KEY }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:           ${{ secrets.GMAIL_TO }}
+        run: python garmin_daily.py
