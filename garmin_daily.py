@@ -288,15 +288,18 @@ def extract_fresh_metrics(garmin_data: dict) -> dict:
         result["training_load"] = load_entry
 
     # ── LETZTE SCHWIMM-SESSION ───────────────────────────────────────────────
+    # Garmin gibt activityType manchmal als String, manchmal als Dict zurück
+    def get_type_str(a):
+        t = a.get("activityType", "")
+        if isinstance(t, dict):
+            return str(t.get("typeKey") or t.get("typeId") or "").lower()
+        return str(t).lower()
+
     activities = garmin_data.get("activities", [])
-    swim_acts  = [a for a in activities
-                  if "swim" in a.get("activityType", "").lower()
-                  or "swimming" in a.get("activityType", "").lower()]
-    run_acts   = [a for a in activities
-                  if a.get("activityType") in
+    swim_acts  = [a for a in activities if "swim" in get_type_str(a)]
+    run_acts   = [a for a in activities if get_type_str(a) in
                   ["running","treadmill_running","trail_running","track_running"]]
-    bike_acts  = [a for a in activities
-                  if "cycling" in a.get("activityType", "").lower()]
+    bike_acts  = [a for a in activities if "cycling" in get_type_str(a)]
 
     def last_activity_info(acts):
         if not acts: return None
