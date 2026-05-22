@@ -120,6 +120,36 @@ def generate_dashboard(garmin_data: dict) -> str:
 
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
     today_str = datetime.date.today().strftime("%A, %d. %B %Y")
+    today_date = datetime.date.today()
+
+    # ── EVENTS — hier einfach neue Rennen/Events eintragen ───────────────────
+    # Format: ("Name", "YYYY-MM-DD", "Ort", "Distanz/Format", "Notizen")
+    events = [
+        ("IfA Nonstop Triathlon Bamberg",
+         "2026-06-07",
+         "Ebinger See, Rattelsdorf",
+         "Sprint: 750m Swim / 21km Bike / 5km Run",
+         "Erster Triathlon, Massenstart 13:30 Uhr"),
+        # Weitere Events einfach hier eintragen:
+        # ("Name", "2026-08-01", "Ort", "Format", "Notiz"),
+    ]
+
+    events_info = ""
+    for name, ev_date_str, loc, dist, note in events:
+        ev_date = datetime.date.fromisoformat(ev_date_str)
+        days_left = (ev_date - today_date).days
+        if days_left >= 0:
+            if days_left <= 6:    phase = "RACE WEEK 🔴"
+            elif days_left <= 13: phase = "Taper 🟡"
+            elif days_left <= 29: phase = "Race-Sharpening 🟡"
+            elif days_left <= 59: phase = "Spezifische Vorbereitung 🟢"
+            else:                 phase = "Basisaufbau 🟢"
+            events_info += (
+                f"\n• {name} | {ev_date_str} | NOCH {days_left} TAGE"
+                f" | Phase: {phase}"
+                f"\n  Ort: {loc} | Strecke: {dist}"
+                f"\n  Notiz: {note}\n"
+            )
 
     # Daten auf 60k Zeichen kürzen (API-Limit)
     data_str = json.dumps(garmin_data, indent=2, default=str)
@@ -129,12 +159,15 @@ def generate_dashboard(garmin_data: dict) -> str:
     prompt = f"""Du bist ein daten-getriebener Ausdauer-Coach und Sports Scientist.
 Analysiere diese Garmin-Daten von Hannes Raschke:
 - 20 Jahre, 182cm, 81.8kg
-- Sprint-Triathlon: IfA Nonstop Bamberg, 7. Juni 2026 (750m Swim / 21km Bike / 5km Run)
 - Garmin Forerunner 965
 - HFmax: 196 bpm | Z2: 118–137 bpm | Z5 VO2max: >176 bpm
 - Aktuelle VO2max (Garmin): 47 | Biometrisch: 50.6
 - Kern-Problem: 79% der Laufzeit in Zone 4, 0% in Zone 2
 - FTP Real: 216W (Garmin-Anzeige 363W ist falsch)
+- Schwimm-Warnung: wenn letzte Schwimmeinheit >7 Tage her → rote Warnung
+
+KOMMENDE EVENTS:
+{events_info}
 
 GARMIN DATEN ({today_str}):
 {data_str}
@@ -146,35 +179,114 @@ Erstelle ein vollständiges, standalone HTML-Dashboard. WICHTIG:
 - Dunkel: Hintergrund #080c08, Grün #4cff7c, Amber #ffb84c, Rot #ff6060, Text #ddeedd
 - Schrift: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif
 
-Das Dashboard muss genau diese Sektionen enthalten:
+Das Dashboard muss EXAKT in dieser Reihenfolge aufgebaut sein:
 
-## 1. TAGES-EMPFEHLUNG — ganz oben, groß, prominent
-Basierend auf heutiger HRV, Sleep Score letzte Nacht, ACWR und Body Battery:
-- GRÜN: Konkrete Session mit HR-Zonen und Distanz/Dauer
-- ORANGE: Leichte Session — was genau
-- ROT: Ruhetag — warum genau
-Zahl + Begründung in 2–3 Sätzen aus den echten Datenwerten.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+## SEKTION 1 — HEADER: Datum + Name
+Klein, dezent. Nur "Guten Morgen Hannes — {today_str}"
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## 2. HEUTE AUF EINEN BLICK — KPI-Raster
-VO2max | RHR | HRV heute | Sleep Score letzte Nacht | Body Battery | Training Readiness Score | ACWR
+## SEKTION 2 — AKTUELLE METRIKEN (ganz oben, prominent)
+Ein großes KPI-Raster mit ALLEN heutigen Werten auf einen Blick.
+Zeige jeden Wert als große Zahl + Label + Ampelfarbe (Grün/Amber/Rot):
 
-## 3. TRAINING LOAD — ATL / CTL / ACWR
-Aktuelle Werte + Ampel (Grün/Orange/Rot) + 1 Satz Interpretation
+- Sleep Score letzte Nacht (Zahl + Bewertung)
+- HRV heute morgen in ms (Zahl + Trend-Pfeil vs. Wochenschnitt)
+- Training Readiness Score (Zahl + Level wie PRIME/HIGH/MODERATE/LOW)
+- Body Battery aktuell (Zahl von 100)
+- Ruheherzfrequenz heute (bpm)
+- VO2max Laufen / Biometrisch (47 / 50.6 — erkläre kurz den Unterschied in 1 Satz darunter)
+- ACWR (Zahl + Ampel: <0.8 = zu wenig, 0.8–1.3 = optimal, >1.3 = Achtung)
 
-## 4. LETZTE 7 TAGE — Trainingsübersicht
-Jede Session: Datum, Typ, Distanz, Dauer, Avg HR, VO2max falls vorhanden
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## 5. SCHLAF LETZTE 7 NÄCHTE
-Tabelle: Datum | Score | Dauer | REM | Deep | SpO2-Min
+## SEKTION 3 — TAGES-EMPFEHLUNG
+Erst NACHDEM die Metriken gezeigt wurden, kommt die Empfehlung.
+Groß und klar: GRÜN / ORANGE / ROT
+Begründung: "HRV X ms (Y% über Baseline), Sleep Z, ACWR W → deshalb..."
+Konkrete Session: Typ, Distanz/Dauer, exakte HR-Zonen in bpm.
+Beispiel: "4×4 min Intervalle @ 167–177 bpm · WU 2km Z2 · CD 1.5km"
 
-## 6. BAMBERG COUNTDOWN
-Verbleibende Tage bis 7. Juni 2026.
-Status-Ampel für Swim / Bike / Run basierend auf letzten Sessions.
-Nächste geplante Session pro Disziplin.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-## 7. VO2MAX TRACKER
-Letzter bekannter Wert + Trend der letzten Wochen aus den Daten.
-Leading-Indikator: Pace @ 130bpm wenn messbar.
+## SEKTION 4 — TRAININGSPLAN NÄCHSTE 5 TAGE
+Basierend auf aktuellem ACWR, HRV-Trend und Bamberg-Countdown:
+Zeige für jeden der nächsten 5 Tage (heute bis +4 Tage):
+- Wochentag + Datum
+- Geplante Session (Typ, Distanz, HR-Zone)
+- Intensitätslevel: HART / MITTEL / LEICHT / RUHE
+- Kurze Begründung (1 Satz)
+
+Berücksichtige dabei:
+- Nach harten Sessions mindestens 1 Ruhe/Leicht-Tag
+- Swim-Sessions wegen Bamberg priorisieren wenn >7 Tage keine Schwimmeinheit
+- Bamberg-Countdown: wenn <14 Tage bis 7. Juni → Tapering einleiten
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## SEKTION 5 — SCHLAF LETZTE 7 NÄCHTE
+Kompakte Tabelle: Datum | Score | Dauer | REM | Deep | SpO2-Min
+Schlechteste Nacht rot markieren, beste grün.
+
+## SEKTION 6 — LETZTE 7 TAGE TRAINING
+Jede Session: Datum | Typ | Distanz | Dauer | Avg HR | Note
+
+## SEKTION 7 — TRAINING LOAD
+ATL | CTL | ACWR mit Ampel + 1 Satz Interpretation
+
+## SEKTION 8 — EVENTS & VORBEREITUNG
+Zeige alle kommenden Events als Karten, sortiert nach Datum.
+Für jedes Event:
+
+┌─────────────────────────────────────────┐
+│  🏁 [Event-Name]                        │
+│  Datum · Ort · Distanz/Format           │
+│  ── X TAGE ──  (große Zahl, Ampelfarbe) │
+│                                         │
+│  Vorbereitungsphase:                    │
+│  > 60 Tage  → "Basisaufbau"             │
+│  30–60 Tage → "Spezifische Vorbereitung"│
+│  14–30 Tage → "Race-Sharpening"         │
+│  7–14 Tage  → "Taper beginnt"           │
+│  < 7 Tage   → "Race Week"               │
+│                                         │
+│  Disziplin-Status (Ampel):              │
+│  🏊 Schwimmen — letzte Session + Note   │
+│  🚴 Radfahren — letzte Session + Note   │
+│  🏃 Laufen   — letzte Session + Note    │
+│                                         │
+│  FOKUS DIESE WOCHE:                     │
+│  Konkret was jetzt wichtigste ist       │
+│  basierend auf verbleibenden Tagen      │
+│  und letzten Sessions pro Disziplin     │
+└─────────────────────────────────────────┘
+
+BEKANNTE EVENTS — berechne Tage ab heute ({today_str}):
+
+EVENT 1:
+- Name: IfA Nonstop Triathlon Bamberg
+- Datum: 7. Juni 2026
+- Ort: Ebinger See, Rattelsdorf bei Bamberg
+- Format: Sprint-Triathlon
+- Strecke: 750m Schwimmen → 21km Radfahren → 5km Laufen
+- Besonderheit: Erster Triathlon von Hannes, Massenstart 13:30 Uhr
+
+Wenn <14 Tage bis Bamberg: zeige detaillierten Taper-Plan.
+Wenn <7 Tage: zeige Renntag-Checkliste.
+
+WICHTIGE VORBEREITUNGSREGELN für Bamberg (aus Hannes' Datenprofil):
+- Schwimmen: Kritisch — wenn >7 Tage keine Schwimmeinheit → rote Warnung + sofortiger Handlungsbedarf
+- Brick-Trainings (Rad+Lauf direkt hintereinander): mind. 2 vor dem Rennen
+- Neopren: Muss im Freiwasser getestet werden
+- ACWR Renntag: sollte zwischen 0.8–1.0 liegen → Taper entsprechend planen
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+DESIGN-REGELN:
+- Sektion 2 (Metriken) und Sektion 3 (Empfehlung) sind die wichtigsten — groß und klar
+- Sektionen 5–8 sind Detailinfo — kompakter, weniger Platz
+- Mobil-first: alles auf 375px Breite lesbar
+- Kein scroll nötig für Sektionen 1–3 (above the fold auf dem Handy)
 
 Antworte AUSSCHLIESSLICH mit dem vollständigen HTML. Kein Text davor oder danach.
 Kein ```html Wrapper. Fang direkt mit <!DOCTYPE html> an."""
