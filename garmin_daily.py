@@ -73,7 +73,7 @@ def get_garmin_data(client: Garmin) -> dict:
     data = {"pulled_at": datetime.datetime.now().isoformat(), "today": today.isoformat()}
 
     try:
-        data["activities"] = client.get_activities(0, 20)
+        data["activities"] = client.get_activities(0, 60)
         print(f"   Aktivitäten: {len(data['activities'])}")
     except Exception as e:
         print(f"   Aktivitäten Fehler: {e}"); data["activities"] = []
@@ -118,7 +118,79 @@ def get_garmin_data(client: Garmin) -> dict:
     try: data["profile"] = client.get_user_profile()
     except: data["profile"] = {}
 
+    # Letzte Session pro Disziplin — schaut 120 Tage zurück (findet auch alte Schwimmeinheiten)
+    data["last_sessions"] = get_last_sessions(client, today, days_back=120)
+
     return data
+
+
+def get_last_sessions(client: Garmin, today: datetime.date, days_back: int = 120) -> dict:
+    """
+    Findet die letzte Session pro Disziplin.
+    Robuster Ansatz: zieht einmal bis zu 100 Aktivitäten (deckt ~3-4 Monate ab)
+    und filtert LOKAL nach Sportart. Zuverlässiger als API-seitige Filter,
+    die je nach Library-Version unterschiedlich funktionieren.
+    """
+    def parse_date(act):
+        ts = act.get("startTimeLocal") or act.get("startTimeGMT")
+        if ts is None: return None
+        if isinstance(ts, str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
+                try: return datetime.datetime.strptime(ts[:26], fmt).date()
+                except: continue
+            try: return datetime.datetime.fromisoformat(ts[:19]).date()
+            except: return None
+        if isinstance(ts, (int, float)):
+            try: return datetime.datetime.fromtimestamp(ts/1000).date()
+            except: return None
+        return None
+
+    def type_of(act):
+        t = act.get("activityType", "")
+        if isinstance(t, dict):
+            return str(t.get("typeKey") or t.get("typeId") or "").lower()
+        return str(t).lower()
+
+    # Einmal viele Aktivitäten ziehen
+    activities = []
+    try:
+        activities = client.get_activities(0, 100)
+    except Exception as e:
+        print(f"   get_activities(100) Fehler: {e}")
+        activities = []
+
+    # Lokal nach Disziplin gruppieren
+    def find_last(matcher):
+        candidates = []
+        for a in activities:
+            tk = type_of(a)
+            if matcher(tk):
+                d = parse_date(a)
+                if d: candidates.append((d, a))
+        if not candidates: return None
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        latest_date, latest = candidates[0]
+        return {
+            "date":         latest_date.isoformat(),
+            "days_ago":     (today - latest_date).days,
+            "name":         latest.get("activityName") or latest.get("name", ""),
+            "distance_m":   int(latest.get("distance", 0) or 0),
+            "duration_min": round((latest.get("duration", 0) or 0) / 60, 0),
+            "avg_hr":       latest.get("averageHR") or latest.get("avgHr"),
+        }
+
+    sessions = {
+        "last_swim": find_last(lambda t: "swim" in t),
+        "last_run":  find_last(lambda t: t in ("running","treadmill_running",
+                                               "trail_running","track_running","virtual_run")),
+        "last_bike": find_last(lambda t: "cycling" in t or "biking" in t),
+    }
+    for sport, info in sessions.items():
+        if info:
+            print(f"   {sport}: {info['days_ago']} Tage her ({info['distance_m']}m, {info['date']})")
+        else:
+            print(f"   {sport}: nichts in {len(activities)} Aktivitäten gefunden")
+    return sessions
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -233,39 +305,11 @@ def extract_fresh_metrics(garmin_data: dict) -> dict:
         if tl.get("acuteChronicWorkloadRatio"):    le["acwr"] = round(tl["acuteChronicWorkloadRatio"],2)
         if le: result["training_load"] = le
 
-    # Letzte Session pro Disziplin
-    def get_type_str(a):
-        t = a.get("activityType","")
-        if isinstance(t, dict): return str(t.get("typeKey") or t.get("typeId") or "").lower()
-        return str(t).lower()
-
-    activities = garmin_data.get("activities", [])
-    swim_acts  = [a for a in activities if "swim" in get_type_str(a)]
-    run_acts   = [a for a in activities if get_type_str(a) in
-                  ["running","treadmill_running","trail_running","track_running"]]
-    bike_acts  = [a for a in activities if "cycling" in get_type_str(a)]
-
-    def last_act_info(acts):
-        if not acts: return None
-        latest = max(acts, key=lambda x: x.get("startTimeLocal",0), default=None)
-        if not latest: return None
-        ts_val = latest.get("startTimeLocal", 0)
-        try:
-            act_date = datetime.datetime.fromtimestamp(ts_val/1000).date()
-            days_ago = (today - act_date).days
-        except: act_date, days_ago = None, None
-        return {
-            "date":       act_date.isoformat() if act_date else "?",
-            "days_ago":   days_ago,
-            "name":       latest.get("name",""),
-            "distance_m": int(latest.get("distance",0)/100) if latest.get("distance") else 0,
-            "duration_min": round(latest.get("duration",0)/60000, 0) if latest.get("duration") else 0,
-            "avg_hr":     latest.get("avgHr"),
-        }
-
-    if swim_acts:  result["last_swim"]  = last_act_info(swim_acts)
-    if run_acts:   result["last_run"]   = last_act_info(run_acts)
-    if bike_acts:  result["last_bike"]  = last_act_info(bike_acts)
+    # Letzte Session pro Disziplin — date-based Suche (zuverlässig, 120 Tage zurück)
+    last_sessions = garmin_data.get("last_sessions", {})
+    if last_sessions.get("last_swim"): result["last_swim"] = last_sessions["last_swim"]
+    if last_sessions.get("last_run"):  result["last_run"]  = last_sessions["last_run"]
+    if last_sessions.get("last_bike"): result["last_bike"] = last_sessions["last_bike"]
 
     return result
 
@@ -467,54 +511,72 @@ Bei Brick: wähle den Haupt-Sport (meist cycling), beschreibe Run im description
 def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
     """
     Konvertiert das vereinfachte Step-Format in Garmins natives API-Format.
-    Unterstützt: einfache Schritte + Wiederholungsgruppen (Intervall+Erholung).
+    Enthält ALLE Pflichtfelder: stepId, displayOrder, displayable, type.
+    Unterstützt einfache Schritte + Wiederholungsgruppen.
     """
     SPORT_TYPES = {
-        "running":  {"sportTypeId": 1,  "sportTypeKey": "running"},
-        "cycling":  {"sportTypeId": 2,  "sportTypeKey": "cycling"},
-        "swimming": {"sportTypeId": 5,  "sportTypeKey": "lap_swimming"},
-        "other":    {"sportTypeId": 4,  "sportTypeKey": "other"},
+        "running":  {"sportTypeId": 1, "sportTypeKey": "running",      "displayOrder": 1},
+        "cycling":  {"sportTypeId": 2, "sportTypeKey": "cycling",      "displayOrder": 2},
+        "swimming": {"sportTypeId": 5, "sportTypeKey": "lap_swimming", "displayOrder": 5},
+        "other":    {"sportTypeId": 4, "sportTypeKey": "other",        "displayOrder": 4},
     }
     STEP_TYPES = {
-        "warmup":   {"stepTypeId": 1, "stepTypeKey": "warmup"},
-        "cooldown": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
-        "interval": {"stepTypeId": 3, "stepTypeKey": "interval"},
-        "recovery": {"stepTypeId": 4, "stepTypeKey": "recovery"},
-        "active":   {"stepTypeId": 3, "stepTypeKey": "interval"},
-        "rest":     {"stepTypeId": 5, "stepTypeKey": "rest"},
+        "warmup":   {"stepTypeId": 1, "stepTypeKey": "warmup",   "displayOrder": 1},
+        "cooldown": {"stepTypeId": 2, "stepTypeKey": "cooldown", "displayOrder": 2},
+        "interval": {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
+        "recovery": {"stepTypeId": 4, "stepTypeKey": "recovery", "displayOrder": 4},
+        "active":   {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
+        "rest":     {"stepTypeId": 5, "stepTypeKey": "rest",     "displayOrder": 5},
     }
     END_COND = {
-        "distance": {"conditionTypeId": 3, "conditionTypeKey": "distance"},
-        "time":     {"conditionTypeId": 2, "conditionTypeKey": "time"},
+        "distance": {"conditionTypeId": 3, "conditionTypeKey": "distance",
+                     "displayOrder": 3, "displayable": True},
+        "time":     {"conditionTypeId": 2, "conditionTypeKey": "time",
+                     "displayOrder": 2, "displayable": True},
+        "lap":      {"conditionTypeId": 1, "conditionTypeKey": "lap.button",
+                     "displayOrder": 1, "displayable": True},
     }
-    HR_TARGET = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"}
-    NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
+    ITER_COND = {"conditionTypeId": 7, "conditionTypeKey": "iterations",
+                 "displayOrder": 7, "displayable": False}
+    HR_TARGET = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone",
+                 "displayOrder": 4}
+    NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target",
+                 "displayOrder": 1}
 
     sport      = workout_plan.get("sport", "running")
     sport_type = SPORT_TYPES.get(sport, SPORT_TYPES["running"])
     steps_in   = workout_plan.get("steps", [])
 
+    # Globaler stepId-Zähler über ALLE Schritte (auch verschachtelte)
+    counter = {"id": 0}
+    def next_id():
+        counter["id"] += 1
+        return counter["id"]
+
     def make_exec_step(step, order):
-        phase   = step.get("phase","active")
-        et      = step.get("end_type","distance")
-        ev      = step.get("end_value", 1000)
-        hr_min  = step.get("hr_min")
-        hr_max  = step.get("hr_max")
+        phase  = step.get("phase", "active")
+        et     = step.get("end_type", "distance")
+        ev     = float(step.get("end_value", 1000))
+        hr_min = step.get("hr_min")
+        hr_max = step.get("hr_max")
+        has_hr = bool(hr_min and hr_max)
         return {
-            "type": "ExecutableStepDTO",
-            "stepOrder": order,
-            "stepType": STEP_TYPES.get(phase, STEP_TYPES["interval"]),
-            "description": step.get("name",""),
-            "endCondition": END_COND.get(et, END_COND["distance"]),
+            "type":              "ExecutableStepDTO",
+            "stepId":            next_id(),
+            "stepOrder":         order,
+            "stepType":          STEP_TYPES.get(phase, STEP_TYPES["interval"]),
+            "childStepId":       None,
+            "description":       step.get("name", ""),
+            "endCondition":      END_COND.get(et, END_COND["distance"]),
             "endConditionValue": ev,
-            "targetType": HR_TARGET if (hr_min and hr_max) else NO_TARGET,
-            "targetValueOne":  hr_min or 0,
-            "targetValueTwo":  hr_max or 0,
-            "childStepId": None,
+            "preferredEndConditionUnit": None,
+            "endConditionCompare": None,
+            "targetType":        HR_TARGET if has_hr else NO_TARGET,
+            "targetValueOne":    float(hr_min) if has_hr else None,
+            "targetValueTwo":    float(hr_max) if has_hr else None,
+            "zoneNumber":        None,
         }
 
-    # Gruppiere Schritte nach repeats-Zahl
-    # Schritte mit repeats>1 und gleicher Zahl → RepeatGroup
     garmin_steps = []
     order = 1
     i = 0
@@ -523,40 +585,44 @@ def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
         rep  = step.get("repeats", 1)
 
         if rep > 1:
-            # Sammle alle Schritte mit gleicher repeats-Zahl
+            # Sammle aufeinanderfolgende Schritte mit gleicher repeats-Zahl
             group_steps = []
-            while i < len(steps_in) and steps_in[i].get("repeats",1) == rep:
+            while i < len(steps_in) and steps_in[i].get("repeats", 1) == rep:
                 group_steps.append(steps_in[i])
                 i += 1
 
-            inner_steps = []
-            inner_order = order + 1
+            repeat_id = next_id()
+            inner = []
+            inner_order = 1
             for gs in group_steps:
-                inner_steps.append(make_exec_step(gs, inner_order))
+                inner.append(make_exec_step(gs, inner_order))
                 inner_order += 1
 
-            repeat_group = {
-                "type": "RepeatGroupDTO",
-                "stepOrder": order,
-                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+            garmin_steps.append({
+                "type":               "RepeatGroupDTO",
+                "stepId":             repeat_id,
+                "stepOrder":          order,
+                "stepType":           {"stepTypeId": 6, "stepTypeKey": "repeat",
+                                       "displayOrder": 6},
+                "childStepId":        1,
                 "numberOfIterations": rep,
-                "smartRepeat": False,
-                "childStepId": order + 1,
-                "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations"},
-                "endConditionValue": None,
-                "workoutSteps": inner_steps,
-            }
-            garmin_steps.append(repeat_group)
-            order = inner_order
+                "smartRepeat":        False,
+                "endCondition":       ITER_COND,
+                "endConditionValue":  float(rep),
+                "workoutSteps":       inner,
+                "skipLastRestStep":   False,
+            })
+            order += 1
         else:
             garmin_steps.append(make_exec_step(step, order))
             order += 1
             i += 1
 
     return {
-        "workoutName": workout_plan.get("name", f"Training {today.isoformat()}"),
-        "description": workout_plan.get("description",""),
-        "sportType":   sport_type,
+        "workoutName":  workout_plan.get("name", f"Training {today.isoformat()}"),
+        "description":  workout_plan.get("description", ""),
+        "sportType":    sport_type,
+        "subSportType": None,
         "workoutSegments": [{
             "segmentOrder": 1,
             "sportType":    sport_type,
@@ -571,93 +637,100 @@ def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
 def upload_workout_to_garmin(client: Garmin, workout_dict: dict,
                              today: datetime.date) -> dict:
     """
-    Lädt Workout über Garmins interne API hoch + plant es für heute.
-    Nutzt den garth HTTP-Client den garminconnect intern verwendet.
+    Lädt Workout über Garmins workout-service hoch + plant es für heute.
+    Nutzt garth.connectapi() — die korrekte Methode des internen HTTP-Clients.
+    Mehrere Fallback-Strategien für maximale Robustheit.
     """
     def extract_id(result):
         if isinstance(result, dict):
-            return result.get("workoutId") or result.get("id") or result.get("workout_id")
-        try: return int(result)
-        except: return None
+            return (result.get("workoutId") or result.get("id")
+                    or result.get("workout_id"))
+        if isinstance(result, (int, str)):
+            try: return int(result)
+            except: return None
+        return None
 
-    try:
-        print("   Workout wird hochgeladen...")
-
-        # ── Ansatz 1: garth (interner HTTP-Client, zuverlässigste Methode) ──
-        if hasattr(client, "garth"):
-            try:
-                resp = client.garth.post(
-                    "connectapi",
-                    "/workout-service/workout",
-                    json=workout_dict
-                )
-                result = resp if isinstance(resp, dict) else (
-                    resp.json() if hasattr(resp, "json") else {}
-                )
-                workout_id = extract_id(result)
-                print(f"   Garth Upload — Workout ID: {workout_id}")
-
-                if workout_id:
-                    try:
-                        client.garth.post(
-                            "connectapi",
-                            f"/workout-service/schedule/{workout_id}",
-                            json={"date": today.isoformat()}
-                        )
-                        print(f"   ✓ Für heute geplant")
-                    except Exception as se:
-                        print(f"   Scheduling Fehler: {se}")
-                    return {
-                        "success": True,
-                        "workout_id": workout_id,
-                        "message": "Workout erstellt und für heute geplant ✓",
-                        "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
-                    }
-                else:
-                    return {"success": True, "workout_id": None,
-                            "message": "Workout hochgeladen ✓ (Garmin Connect → Meine Workouts)"}
-            except Exception as garth_err:
-                print(f"   Garth-Methode Fehler: {garth_err} — versuche Fallback")
-
-        # ── Ansatz 2: add_workout (falls vorhanden) ──────────────────────────
-        if hasattr(client, "add_workout"):
-            result    = client.add_workout(workout_dict)
-            workout_id = extract_id(result)
-            if workout_id and hasattr(client, "schedule_workout"):
-                try: client.schedule_workout(workout_id, today.isoformat())
-                except: pass
-            return {
-                "success": True,
-                "workout_id": workout_id,
-                "message": "Workout erstellt ✓ (via add_workout)",
-                "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}" if workout_id else None
-            }
-
-        # ── Ansatz 3: requests-Session (letzter Fallback) ────────────────────
-        if hasattr(client, "session"):
-            headers = {"Content-Type": "application/json", "NK": "NT"}
-            resp = client.session.post(
-                "https://connect.garmin.com/workout-service/workout",
-                json=workout_dict,
-                headers=headers
+    def try_schedule(workout_id):
+        """Plant Workout für heute. Mehrere Methoden."""
+        date_str = today.isoformat()
+        # garth connectapi
+        try:
+            client.garth.connectapi(
+                f"/workout-service/schedule/{workout_id}",
+                method="POST",
+                json={"date": date_str}
             )
-            if resp.status_code in (200, 201):
-                result    = resp.json()
-                workout_id = extract_id(result)
-                return {
-                    "success": True,
-                    "workout_id": workout_id,
-                    "message": "Workout erstellt ✓ (via Session)",
-                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}" if workout_id else None
-                }
+            print(f"   ✓ Für heute ({date_str}) geplant")
+            return True
+        except Exception as e:
+            print(f"   Scheduling via connectapi fehlgeschlagen: {e}")
+        return False
 
-        return {"success": False, "workout_id": None,
-                "message": "Kein kompatibler Upload-Weg gefunden — Session manuell starten"}
+    workout_id = None
+    upload_method = None
 
-    except Exception as e:
-        print(f"   Workout-Upload Fehler: {e}")
-        return {"success": False, "workout_id": None,
-                "message": f"Upload fehlgeschlagen: {str(e)[:150]}"}
+    # ── METHODE 1: garth.connectapi (korrekte primäre Methode) ───────────────
+    if hasattr(client, "garth"):
+        try:
+            result = client.garth.connectapi(
+                "/workout-service/workout",
+                method="POST",
+                json=workout_dict
+            )
+            workout_id = extract_id(result)
+            if workout_id:
+                upload_method = "garth.connectapi"
+                print(f"   ✓ Upload via connectapi — Workout ID: {workout_id}")
+        except Exception as e:
+            print(f"   connectapi fehlgeschlagen: {str(e)[:120]}")
+
+    # ── METHODE 2: garth.post mit voller URL ─────────────────────────────────
+    if not workout_id and hasattr(client, "garth"):
+        try:
+            resp = client.garth.post(
+                "connectapi",
+                "/workout-service/workout",
+                json=workout_dict,
+                api=True
+            )
+            result = resp.json() if hasattr(resp, "json") else resp
+            workout_id = extract_id(result)
+            if workout_id:
+                upload_method = "garth.post"
+                print(f"   ✓ Upload via garth.post — Workout ID: {workout_id}")
+        except Exception as e:
+            print(f"   garth.post fehlgeschlagen: {str(e)[:120]}")
+
+    # ── METHODE 3: add_workout (falls Library-Version es hat) ────────────────
+    if not workout_id and hasattr(client, "add_workout"):
+        try:
+            result = client.add_workout(workout_dict)
+            workout_id = extract_id(result)
+            if workout_id:
+                upload_method = "add_workout"
+                print(f"   ✓ Upload via add_workout — Workout ID: {workout_id}")
+        except Exception as e:
+            print(f"   add_workout fehlgeschlagen: {str(e)[:120]}")
+
+    # ── Ergebnis auswerten ────────────────────────────────────────────────────
+    if workout_id:
+        scheduled = try_schedule(workout_id)
+        msg = ("Workout erstellt und für heute geplant ✓" if scheduled
+               else "Workout erstellt ✓ (Garmin Connect → Trainings → Meine Workouts)")
+        return {
+            "success": True,
+            "workout_id": workout_id,
+            "scheduled": scheduled,
+            "method": upload_method,
+            "message": msg,
+            "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
+        }
+    else:
+        return {
+            "success": False,
+            "workout_id": None,
+            "message": "Upload über alle Methoden fehlgeschlagen — Session manuell auf der Uhr starten"
+        }
 
 
 # ═════════════════════════════════════════════════════════════════════════════
