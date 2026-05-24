@@ -21,6 +21,7 @@ import traceback
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from garminconnect import Garmin
+import time
 import anthropic
 
 # ── CREDENTIALS ───────────────────────────────────────────────────────────────
@@ -570,61 +571,93 @@ def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
 def upload_workout_to_garmin(client: Garmin, workout_dict: dict,
                              today: datetime.date) -> dict:
     """
-    Lädt Workout hoch + plant es für heute.
-    Gibt Status-Dict zurück das im Dashboard angezeigt wird.
+    Lädt Workout über Garmins interne API hoch + plant es für heute.
+    Nutzt den garth HTTP-Client den garminconnect intern verwendet.
     """
+    def extract_id(result):
+        if isinstance(result, dict):
+            return result.get("workoutId") or result.get("id") or result.get("workout_id")
+        try: return int(result)
+        except: return None
+
     try:
         print("   Workout wird hochgeladen...")
-        result = client.add_workout(workout_dict)
 
-        if result is None:
-            return {"success": False, "workout_id": None,
-                    "message": "Garmin API hat keine Antwort zurückgegeben"}
-
-        # Workout-ID extrahieren
-        workout_id = None
-        if isinstance(result, dict):
-            workout_id = (result.get("workoutId") or result.get("id")
-                          or result.get("workout_id"))
-        elif isinstance(result, (int, str)):
-            try: workout_id = int(result)
-            except: pass
-
-        print(f"   Workout erstellt — ID: {workout_id}")
-
-        if workout_id:
-            # Für heute planen
+        # ── Ansatz 1: garth (interner HTTP-Client, zuverlässigste Methode) ──
+        if hasattr(client, "garth"):
             try:
-                client.schedule_workout(workout_id, today.isoformat())
-                print(f"   ✓ Für heute ({today.isoformat()}) geplant")
-                return {
-                    "success": True,
-                    "workout_id": workout_id,
-                    "message": f"Workout erstellt und für heute geplant ✓",
-                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
-                }
-            except Exception as sched_err:
-                print(f"   Scheduling Fehler (harmlos): {sched_err}")
-                return {
-                    "success": True,
-                    "workout_id": workout_id,
-                    "message": f"Workout erstellt ✓ (Garmin Connect → Trainings → Meine Workouts)",
-                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
-                }
-        else:
+                resp = client.garth.post(
+                    "connectapi",
+                    "/workout-service/workout",
+                    json=workout_dict
+                )
+                result = resp if isinstance(resp, dict) else (
+                    resp.json() if hasattr(resp, "json") else {}
+                )
+                workout_id = extract_id(result)
+                print(f"   Garth Upload — Workout ID: {workout_id}")
+
+                if workout_id:
+                    try:
+                        client.garth.post(
+                            "connectapi",
+                            f"/workout-service/schedule/{workout_id}",
+                            json={"date": today.isoformat()}
+                        )
+                        print(f"   ✓ Für heute geplant")
+                    except Exception as se:
+                        print(f"   Scheduling Fehler: {se}")
+                    return {
+                        "success": True,
+                        "workout_id": workout_id,
+                        "message": "Workout erstellt und für heute geplant ✓",
+                        "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
+                    }
+                else:
+                    return {"success": True, "workout_id": None,
+                            "message": "Workout hochgeladen ✓ (Garmin Connect → Meine Workouts)"}
+            except Exception as garth_err:
+                print(f"   Garth-Methode Fehler: {garth_err} — versuche Fallback")
+
+        # ── Ansatz 2: add_workout (falls vorhanden) ──────────────────────────
+        if hasattr(client, "add_workout"):
+            result    = client.add_workout(workout_dict)
+            workout_id = extract_id(result)
+            if workout_id and hasattr(client, "schedule_workout"):
+                try: client.schedule_workout(workout_id, today.isoformat())
+                except: pass
             return {
                 "success": True,
-                "workout_id": None,
-                "message": "Workout erstellt ✓ (Garmin Connect → Trainings → Meine Workouts)"
+                "workout_id": workout_id,
+                "message": "Workout erstellt ✓ (via add_workout)",
+                "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}" if workout_id else None
             }
+
+        # ── Ansatz 3: requests-Session (letzter Fallback) ────────────────────
+        if hasattr(client, "session"):
+            headers = {"Content-Type": "application/json", "NK": "NT"}
+            resp = client.session.post(
+                "https://connect.garmin.com/workout-service/workout",
+                json=workout_dict,
+                headers=headers
+            )
+            if resp.status_code in (200, 201):
+                result    = resp.json()
+                workout_id = extract_id(result)
+                return {
+                    "success": True,
+                    "workout_id": workout_id,
+                    "message": "Workout erstellt ✓ (via Session)",
+                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}" if workout_id else None
+                }
+
+        return {"success": False, "workout_id": None,
+                "message": "Kein kompatibler Upload-Weg gefunden — Session manuell starten"}
 
     except Exception as e:
         print(f"   Workout-Upload Fehler: {e}")
-        return {
-            "success": False,
-            "workout_id": None,
-            "message": f"Upload fehlgeschlagen: {str(e)[:120]}"
-        }
+        return {"success": False, "workout_id": None,
+                "message": f"Upload fehlgeschlagen: {str(e)[:150]}"}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -800,6 +833,51 @@ def send_email(html_content: str, date_str: str):
         server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
 
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+# SMART SLEEP POLLING — wartet bis heutiger Sleep Score verfügbar
+# ═════════════════════════════════════════════════════════════════════════════
+def wait_for_sleep_score(client: Garmin, max_wait_min: int = 90,
+                          poll_interval_sec: int = 180) -> bool:
+    """
+    Prüft alle 3 Minuten ob der Sleep Score für HEUTE verfügbar ist.
+    Gibt True zurück sobald Score da ist, False nach Timeout.
+    Der Score wird von Garmin erst nach dem Aufwachen + Handy-Sync finalisiert.
+    """
+    today      = datetime.date.today()
+    start_time = datetime.datetime.now()
+    max_delta  = datetime.timedelta(minutes=max_wait_min)
+    attempt    = 0
+
+    print(f"   Smart Sleep Polling — warte auf Score für {today}")
+    print(f"   Max Wartezeit: {max_wait_min} min | Intervall: {poll_interval_sec//60} min")
+
+    while datetime.datetime.now() - start_time < max_delta:
+        attempt += 1
+        try:
+            raw = client.get_sleep_data(today.isoformat())
+            if raw and isinstance(raw, dict):
+                dto    = raw.get("dailySleepDTO") or raw
+                scores = dto.get("sleepScores", {}) if isinstance(dto, dict) else {}
+                score  = (scores.get("overallScore")
+                          or dto.get("overallSleepScore")
+                          or scores.get("overall", {}).get("value"))
+                if score and int(score) > 0:
+                    elapsed = (datetime.datetime.now() - start_time).seconds // 60
+                    print(f"   ✓ Sleep Score {score} gefunden (nach {elapsed} min, Versuch {attempt})")
+                    return True
+        except Exception as e:
+            print(f"   Poll-Fehler (Versuch {attempt}): {e}")
+
+        elapsed_min = (datetime.datetime.now() - start_time).seconds // 60
+        remaining   = max_wait_min - elapsed_min
+        print(f"   Versuch {attempt}: kein Score — {elapsed_min}min gewartet,"
+              f" noch {remaining}min | nächster Check in {poll_interval_sec//60}min")
+        time.sleep(poll_interval_sec)
+
+    print(f"   ⚠️ Timeout nach {max_wait_min} min — weiter ohne heutigen Sleep Score")
+    return False
+
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═════════════════════════════════════════════════════════════════════════════
@@ -814,6 +892,10 @@ def main():
         # ── 1. Login (einmalig, für Lesen + Schreiben) ────────────────────────
         print("1/6 — Garmin Login...")
         garmin_client = get_garmin_client()
+
+        # ── 1b. Warten bis heutiger Sleep Score verfügbar ────────────────────
+        print("1b/6 — Warte auf heutigen Sleep Score...")
+        wait_for_sleep_score(garmin_client, max_wait_min=90, poll_interval_sec=180)
 
         # ── 2. Daten laden ────────────────────────────────────────────────────
         print("2/6 — Daten laden...")
