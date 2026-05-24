@@ -3,13 +3,14 @@
 Garmin Daily Dashboard — Hannes Raschke
 Täglich automatisch ausgeführt von GitHub Actions um 06:15 Uhr CEST.
 
-Architektur:
-  1. get_garmin_data()       — rohe Garmin-Daten ziehen
-  2. extract_fresh_metrics() — frischeste Datenpunkte isolieren + labeln
-  3. get_day_context()       — Tagestyp, Trainingszeit, Feiertage
-  4. get_events_context()    — Events mit Countdown + Phase
-  5. generate_dashboard()    — alles an Claude → HTML
-  6. send_email()            — HTML per iCloud verschicken
+Ablauf:
+  1. Garmin-Login (Client wird für Lesen + Schreiben wiederverwendet)
+  2. Alle Daten ziehen
+  3. Kontext aufbauen (Tag, Events, frische Metriken)
+  4. Claude → Workout-Entscheidung (strukturiertes JSON)
+  5. Workout in Garmin Connect hochladen + für heute planen
+  6. Claude → HTML-Dashboard (mit Workout-Bestätigung)
+  7. Dashboard per iCloud E-Mail senden
 """
 
 import os
@@ -30,10 +31,8 @@ GMAIL_USER         = os.environ["GMAIL_USER"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 GMAIL_TO           = os.environ["GMAIL_TO"]
 
+WEEKDAY_DE = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
 
-# ─────────────────────────────────────────────────────────────────────────────
-# BAYERISCHE FEIERTAGE 2026
-# ─────────────────────────────────────────────────────────────────────────────
 BAVARIAN_HOLIDAYS = {
     datetime.date(2026, 1,  1): "Neujahr",
     datetime.date(2026, 1,  6): "Heilige Drei Könige",
@@ -50,30 +49,34 @@ BAVARIAN_HOLIDAYS = {
     datetime.date(2026, 12,26): "2. Weihnachtstag",
 }
 
-WEEKDAY_DE = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-def get_garmin_data() -> dict:
-    """Verbindet mit Garmin und zieht alle relevanten Rohdaten."""
-
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. GARMIN CLIENT
+# ═════════════════════════════════════════════════════════════════════════════
+def get_garmin_client() -> Garmin:
+    """Login einmalig — Client wird für Lesen UND Schreiben (Workout-Upload) genutzt."""
     client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
     client.login()
+    print("   ✓ Garmin Login erfolgreich")
+    return client
 
-    today    = datetime.date.today()
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. DATEN LADEN
+# ═════════════════════════════════════════════════════════════════════════════
+def get_garmin_data(client: Garmin) -> dict:
+    """Zieht alle relevanten Rohdaten der letzten 14 Tage."""
+    today   = datetime.date.today()
     dates_14 = [(today - datetime.timedelta(days=i)).isoformat() for i in range(14)]
     dates_7  = dates_14[:7]
-
     data = {"pulled_at": datetime.datetime.now().isoformat(), "today": today.isoformat()}
 
-    # Aktivitäten (letzte 20)
     try:
         data["activities"] = client.get_activities(0, 20)
         print(f"   Aktivitäten: {len(data['activities'])}")
     except Exception as e:
-        print(f"   Aktivitäten: Fehler — {e}"); data["activities"] = []
+        print(f"   Aktivitäten Fehler: {e}"); data["activities"] = []
 
-    # Schlafdaten — wichtig: auch heute abrufen (nach Aufwachen schon verfügbar)
     sleep_list = []
     for date in dates_14:
         try:
@@ -82,217 +85,157 @@ def get_garmin_data() -> dict:
                 dto = s.get("dailySleepDTO") or s
                 if isinstance(dto, dict) and dto.get("calendarDate"):
                     sleep_list.append(dto)
-        except:
-            pass
+        except: pass
     data["sleep"] = sleep_list
     print(f"   Schlaf: {len(sleep_list)} Nächte")
 
-    # HRV — wichtig: heute zuerst, dann zurück
     hrv_list = []
     for date in dates_7:
         try:
             h = client.get_hrv_data(date)
-            if h:
-                hrv_list.append({"date": date, "data": h})
-        except:
-            pass
+            if h: hrv_list.append({"date": date, "data": h})
+        except: pass
     data["hrv"] = hrv_list
-    print(f"   HRV: {len(hrv_list)} Tage")
 
-    # Training Readiness
     readiness_list = []
     for date in dates_7:
         try:
             r = client.get_training_readiness(date)
-            if r:
-                readiness_list.append({"date": date, "data": r})
-        except:
-            pass
+            if r: readiness_list.append({"date": date, "data": r})
+        except: pass
     data["readiness"] = readiness_list
-    print(f"   Readiness: {len(readiness_list)} Einträge")
 
-    # Training Load (ATL/CTL/ACWR)
-    try:
-        data["training_load"] = client.get_training_load()
-    except Exception as e:
-        print(f"   Training Load: Fehler — {e}"); data["training_load"] = {}
+    try: data["training_load"] = client.get_training_load()
+    except: data["training_load"] = {}
 
-    # Daily Stats heute (RHR, Stress, Steps, Kalorien)
-    try:
-        data["today_stats"] = client.get_stats(today.isoformat())
-    except Exception as e:
-        print(f"   Daily Stats: Fehler — {e}"); data["today_stats"] = {}
+    try: data["today_stats"] = client.get_stats(today.isoformat())
+    except: data["today_stats"] = {}
 
-    # Body Battery letzte 7 Tage
-    try:
-        data["body_battery"] = client.get_body_battery(dates_7[-1], dates_7[0])
-    except Exception as e:
-        print(f"   Body Battery: Fehler — {e}"); data["body_battery"] = []
+    try: data["body_battery"] = client.get_body_battery(dates_7[-1], dates_7[0])
+    except: data["body_battery"] = []
 
-    # User Profile (VO2max etc.)
-    try:
-        data["profile"] = client.get_user_profile()
-    except:
-        data["profile"] = {}
+    try: data["profile"] = client.get_user_profile()
+    except: data["profile"] = {}
 
     return data
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. KONTEXT AUFBAUEN
+# ═════════════════════════════════════════════════════════════════════════════
 def extract_fresh_metrics(garmin_data: dict) -> dict:
-    """
-    Isoliert den aktuellsten Datenpunkt jeder Metrik.
-    Jeder Wert bekommt ein 'freshness'-Label (HEUTE / GESTERN / Datum).
-    Nur was wirklich vorhanden ist wird weitergegeben — kein Auffüllen mit None.
-    """
+    """Isoliert den aktuellsten Datenpunkt jeder Metrik mit Datums-Label."""
     today     = datetime.date.today()
     yesterday = today - datetime.timedelta(days=1)
     result    = {}
 
-    def freshness(date_str):
-        if not date_str: return "unbekannt"
-        if date_str == today.isoformat():     return "HEUTE"
-        if date_str == yesterday.isoformat(): return "GESTERN"
-        return date_str
+    def freshness(d):
+        if not d: return "unbekannt"
+        if d == today.isoformat():     return "HEUTE"
+        if d == yesterday.isoformat(): return "GESTERN"
+        return d
 
-    # ── SCHLAF ───────────────────────────────────────────────────────────────
+    # Schlaf
     sleep_entries = garmin_data.get("sleep", [])
     if sleep_entries:
-        latest = max(sleep_entries,
-                     key=lambda x: x.get("calendarDate", ""), default=None)
+        latest = max(sleep_entries, key=lambda x: x.get("calendarDate",""), default=None)
         if latest:
-            scores    = latest.get("sleepScores", {})
-            overall   = (scores.get("overallScore")
-                         or latest.get("overallSleepScore")
-                         or scores.get("overall", {}).get("value"))
-            dur_s     = (latest.get("deepSleepSeconds", 0)
-                         + latest.get("lightSleepSeconds", 0)
-                         + latest.get("remSleepSeconds", 0))
-            spo2      = latest.get("spo2SleepSummary", {})
-            date_val  = latest.get("calendarDate", "")
-            entry     = {"freshness": freshness(date_val), "date": date_val}
-            if overall:            entry["score"]       = overall
-            if dur_s > 0:          entry["duration_h"]  = round(dur_s / 3600, 1)
-            if latest.get("remSleepSeconds"):
-                entry["rem_h"]  = round(latest["remSleepSeconds"] / 3600, 1)
-            if latest.get("deepSleepSeconds"):
-                entry["deep_h"] = round(latest["deepSleepSeconds"] / 3600, 1)
-            if spo2.get("averageSPO2"): entry["spo2_avg"] = spo2["averageSPO2"]
-            if spo2.get("lowestSPO2"):  entry["spo2_low"] = spo2["lowestSPO2"]
+            scores  = latest.get("sleepScores", {})
+            overall = (scores.get("overallScore") or latest.get("overallSleepScore")
+                       or scores.get("overall",{}).get("value"))
+            dur_s   = (latest.get("deepSleepSeconds",0) + latest.get("lightSleepSeconds",0)
+                       + latest.get("remSleepSeconds",0))
+            spo2    = latest.get("spo2SleepSummary", {})
+            date_v  = latest.get("calendarDate","")
+            entry   = {"freshness": freshness(date_v), "date": date_v}
+            if overall:                     entry["score"]      = overall
+            if dur_s > 0:                   entry["duration_h"] = round(dur_s/3600, 1)
+            if latest.get("remSleepSeconds"):  entry["rem_h"]  = round(latest["remSleepSeconds"]/3600,1)
+            if latest.get("deepSleepSeconds"): entry["deep_h"] = round(latest["deepSleepSeconds"]/3600,1)
+            if spo2.get("averageSPO2"):     entry["spo2_avg"]   = spo2["averageSPO2"]
+            if spo2.get("lowestSPO2"):      entry["spo2_low"]   = spo2["lowestSPO2"]
             result["sleep"] = entry
 
-    # ── HRV ──────────────────────────────────────────────────────────────────
+    # HRV
     hrv_entries = garmin_data.get("hrv", [])
     if hrv_entries:
-        latest = max(hrv_entries, key=lambda x: x.get("date", ""), default=None)
+        latest = max(hrv_entries, key=lambda x: x.get("date",""), default=None)
         if latest:
-            raw  = latest.get("data", {})
+            raw   = latest.get("data", {})
             entry = {"freshness": freshness(latest["date"]), "date": latest["date"]}
-
-            # Garmin gibt HRV in unterschiedlichen Strukturen zurück
-            def search_hrv(obj):
-                if isinstance(obj, dict):
-                    return (obj.get("weeklyAvg") or obj.get("hrvWeeklyAverage")
-                            or obj.get("lastNight") or obj.get("lastNight5MinHigh")
-                            or obj.get("hrvValue"))
-                if isinstance(obj, list):
-                    for item in obj:
-                        v = search_hrv(item)
-                        if v: return v
-                return None
-
-            weekly = None
-            last   = None
+            weekly, last = None, None
             if isinstance(raw, dict):
                 weekly = raw.get("weeklyAvg") or raw.get("hrvWeeklyAverage")
                 last   = raw.get("lastNight") or raw.get("lastNight5MinHigh")
                 if not (weekly or last):
-                    summary = raw.get("hrvSummary", {})
-                    weekly  = summary.get("weeklyAvg") or summary.get("weekly5MinHigh")
-                    last    = summary.get("lastNight") or summary.get("lastNight5MinHigh")
+                    s = raw.get("hrvSummary", {})
+                    weekly = s.get("weeklyAvg") or s.get("weekly5MinHigh")
+                    last   = s.get("lastNight") or s.get("lastNight5MinHigh")
             elif isinstance(raw, list):
                 for item in raw:
                     if isinstance(item, dict):
                         weekly = item.get("weeklyAvg") or item.get("hrvWeeklyAverage")
                         last   = item.get("lastNight") or item.get("lastNight5MinHigh")
                         if weekly or last: break
-
             if weekly: entry["weekly_avg_ms"] = weekly
             if last:   entry["last_night_ms"] = last
-            entry["raw_sample"] = str(raw)[:300]
             result["hrv"] = entry
 
-    # ── TRAINING READINESS ───────────────────────────────────────────────────
+    # Training Readiness
     readiness_entries = garmin_data.get("readiness", [])
     if readiness_entries:
-        latest = max(readiness_entries, key=lambda x: x.get("date", ""), default=None)
+        latest = max(readiness_entries, key=lambda x: x.get("date",""), default=None)
         if latest:
             raw   = latest.get("data", {})
             entry = {"freshness": freshness(latest["date"]), "date": latest["date"]}
-
-            def find_readiness(obj):
+            def find_r(obj):
                 if isinstance(obj, dict):
-                    score = obj.get("score") or obj.get("trainingReadinessScore")
-                    level = obj.get("level") or obj.get("trainingReadinessLevel")
-                    return score, level
+                    return obj.get("score") or obj.get("trainingReadinessScore"), \
+                           obj.get("level") or obj.get("trainingReadinessLevel")
                 if isinstance(obj, list):
                     for item in obj:
-                        s, l = find_readiness(item)
+                        s, l = find_r(item)
                         if s: return s, l
                 return None, None
-
-            score, level = find_readiness(raw)
+            score, level = find_r(raw)
             if score: entry["score"] = score
             if level: entry["level"] = level
             result["readiness"] = entry
 
-    # ── TODAY STATS (RHR, BODY BATTERY, STRESS, STEPS) ──────────────────────
+    # Today Stats
     ts = garmin_data.get("today_stats", {})
     if ts:
-        today_entry = {"freshness": "HEUTE"}
-        if ts.get("restingHeartRate"):           today_entry["rhr"]          = ts["restingHeartRate"]
-        if ts.get("averageStressLevel"):         today_entry["stress_avg"]   = ts["averageStressLevel"]
-        if ts.get("totalSteps"):                 today_entry["steps"]        = ts["totalSteps"]
-        if ts.get("bodyBatteryChargedValue"):    today_entry["bb_charged"]   = ts["bodyBatteryChargedValue"]
-        if ts.get("bodyBatteryDrainedValue"):    today_entry["bb_drained"]   = ts["bodyBatteryDrainedValue"]
-        if ts.get("totalKilocalories"):          today_entry["kcal"]         = ts["totalKilocalories"]
-        result["today_stats"] = today_entry
+        te = {"freshness": "HEUTE"}
+        if ts.get("restingHeartRate"):        te["rhr"]        = ts["restingHeartRate"]
+        if ts.get("averageStressLevel"):      te["stress_avg"] = ts["averageStressLevel"]
+        if ts.get("totalSteps"):              te["steps"]      = ts["totalSteps"]
+        if ts.get("bodyBatteryChargedValue"): te["bb_charged"] = ts["bodyBatteryChargedValue"]
+        if ts.get("bodyBatteryDrainedValue"): te["bb_drained"] = ts["bodyBatteryDrainedValue"]
+        result["today_stats"] = te
 
-    # ── BODY BATTERY AKTUELL ─────────────────────────────────────────────────
+    # Body Battery aktuell
     bb_data = garmin_data.get("body_battery", [])
     if isinstance(bb_data, list) and bb_data:
         try:
             last_bb = bb_data[-1]
             if isinstance(last_bb, dict):
-                val = (last_bb.get("bodyBatteryLevel")
-                       or last_bb.get("charged")
-                       or last_bb.get("value"))
+                val = last_bb.get("bodyBatteryLevel") or last_bb.get("charged") or last_bb.get("value")
                 if val: result["body_battery_now"] = val
-        except:
-            pass
+        except: pass
 
-    # ── TRAINING LOAD (ATL/CTL/ACWR) ────────────────────────────────────────
+    # Training Load
     tl = garmin_data.get("training_load", {})
-    if tl:
-        load_entry = {}
-        if isinstance(tl, dict):
-            atl  = tl.get("acuteLoad") or tl.get("weeklyRunningLoad")
-            ctl  = tl.get("chronicLoad") or tl.get("4weekRunningLoad")
-            acwr_val = tl.get("acuteChronicWorkloadRatio")
-            if atl:     load_entry["atl"]  = atl
-            if ctl:     load_entry["ctl"]  = ctl
-            if acwr_val: load_entry["acwr"] = round(acwr_val, 2)
-        elif isinstance(tl, list) and tl:
-            latest_tl = max(tl, key=lambda x: x.get("calendarDate", ""), default={})
-            load_entry["raw_latest"] = str(latest_tl)[:400]
-        result["training_load"] = load_entry
+    if tl and isinstance(tl, dict):
+        le = {}
+        if tl.get("acuteLoad"):                   le["atl"]  = tl["acuteLoad"]
+        if tl.get("chronicLoad"):                  le["ctl"]  = tl["chronicLoad"]
+        if tl.get("acuteChronicWorkloadRatio"):    le["acwr"] = round(tl["acuteChronicWorkloadRatio"],2)
+        if le: result["training_load"] = le
 
-    # ── LETZTE SCHWIMM-SESSION ───────────────────────────────────────────────
-    # Garmin gibt activityType manchmal als String, manchmal als Dict zurück
+    # Letzte Session pro Disziplin
     def get_type_str(a):
-        t = a.get("activityType", "")
-        if isinstance(t, dict):
-            return str(t.get("typeKey") or t.get("typeId") or "").lower()
+        t = a.get("activityType","")
+        if isinstance(t, dict): return str(t.get("typeKey") or t.get("typeId") or "").lower()
         return str(t).lower()
 
     activities = garmin_data.get("activities", [])
@@ -301,47 +244,40 @@ def extract_fresh_metrics(garmin_data: dict) -> dict:
                   ["running","treadmill_running","trail_running","track_running"]]
     bike_acts  = [a for a in activities if "cycling" in get_type_str(a)]
 
-    def last_activity_info(acts):
+    def last_act_info(acts):
         if not acts: return None
-        latest = max(acts, key=lambda x: x.get("startTimeLocal", 0), default=None)
+        latest = max(acts, key=lambda x: x.get("startTimeLocal",0), default=None)
         if not latest: return None
-        ts = latest.get("startTimeLocal", 0)
+        ts_val = latest.get("startTimeLocal", 0)
         try:
-            act_date = datetime.datetime.fromtimestamp(ts / 1000).date()
+            act_date = datetime.datetime.fromtimestamp(ts_val/1000).date()
             days_ago = (today - act_date).days
-        except:
-            act_date, days_ago = None, None
+        except: act_date, days_ago = None, None
         return {
-            "date": act_date.isoformat() if act_date else "?",
-            "days_ago": days_ago,
-            "name": latest.get("name", ""),
-            "distance_m": int(latest.get("distance", 0) / 100) if latest.get("distance") else 0,
-            "duration_min": round(latest.get("duration", 0) / 60000, 0) if latest.get("duration") else 0,
-            "avg_hr": latest.get("avgHr"),
+            "date":       act_date.isoformat() if act_date else "?",
+            "days_ago":   days_ago,
+            "name":       latest.get("name",""),
+            "distance_m": int(latest.get("distance",0)/100) if latest.get("distance") else 0,
+            "duration_min": round(latest.get("duration",0)/60000, 0) if latest.get("duration") else 0,
+            "avg_hr":     latest.get("avgHr"),
         }
 
-    if swim_acts:  result["last_swim"]  = last_activity_info(swim_acts)
-    if run_acts:   result["last_run"]   = last_activity_info(run_acts)
-    if bike_acts:  result["last_bike"]  = last_activity_info(bike_acts)
+    if swim_acts:  result["last_swim"]  = last_act_info(swim_acts)
+    if run_acts:   result["last_run"]   = last_act_info(run_acts)
+    if bike_acts:  result["last_bike"]  = last_act_info(bike_acts)
 
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def get_day_context(today_date: datetime.date) -> dict:
-    """
-    Berechnet: Tagestyp, verfügbares Trainingsfenster, Länge der möglichen Session.
-    Hannes arbeitet bis 17. Juli 2026.
-    Arbeitszeiten: 06:30 Uhr weg, ab ~16:30 Uhr trainingsfähig.
-    """
-    work_schedule_active = today_date <= datetime.date(2026, 7, 17)
-    weekday  = today_date.weekday()   # 0=Mo, 6=So
-    is_hol   = today_date in BAVARIAN_HOLIDAYS
-    is_wkend = weekday >= 5
-    is_fri   = weekday == 4
-    holiday_name = BAVARIAN_HOLIDAYS.get(today_date, "")
+    """Tagestyp und Trainingskontext."""
+    work_active = today_date <= datetime.date(2026, 7, 17)
+    weekday     = today_date.weekday()
+    is_hol      = today_date in BAVARIAN_HOLIDAYS
+    is_wkend    = weekday >= 5
+    is_fri      = weekday == 4
+    hol_name    = BAVARIAN_HOLIDAYS.get(today_date, "")
 
-    # Nächste freie Tage in den nächsten 10 Tagen
     upcoming_free = []
     for i in range(1, 11):
         d = today_date + datetime.timedelta(days=i)
@@ -354,387 +290,582 @@ def get_day_context(today_date: datetime.date) -> dict:
             })
 
     if is_wkend or is_hol:
-        return {
-            "type": "FREIER_TAG",
-            "label": holiday_name or WEEKDAY_DE[weekday],
-            "training_window": "Ganztags verfügbar",
-            "double_session": True,
-            "note": f"Ganztägig Zeit — längere Sessions und Doppeleinheiten möglich",
-            "upcoming_free_days": upcoming_free,
-        }
-    elif is_fri and work_schedule_active:
-        return {
-            "type": "FREITAG",
-            "label": "Freitag",
-            "training_window": "Ab 16:30 Uhr, Abend offen",
-            "double_session": False,
-            "note": "Freitag — längeres Trainingsfenster als normale Arbeitstage",
-            "upcoming_free_days": upcoming_free,
-        }
-    elif work_schedule_active:
-        return {
-            "type": "ARBEITSTAG",
-            "label": WEEKDAY_DE[weekday],
-            "training_window": "Ab 16:30 Uhr bis ~19:00 (max. 2.5h Fenster)",
-            "double_session": False,
-            "note": "Arbeitstag: Session muss kompakt sein. Kein Zeitdruck wenn Priorität gesetzt.",
-            "upcoming_free_days": upcoming_free,
-        }
+        return {"type": "FREIER_TAG", "label": hol_name or WEEKDAY_DE[weekday],
+                "training_window": "Ganztags", "double_session": True,
+                "note": "Wochenende/Feiertag — ganztags Zeit, längere Sessions möglich",
+                "upcoming_free_days": upcoming_free}
+    elif is_fri and work_active:
+        return {"type": "FREITAG", "label": "Freitag",
+                "training_window": "Ab 16:30 Uhr, Abend offen", "double_session": False,
+                "note": "Freitag — längeres Abend-Trainingsfenster",
+                "upcoming_free_days": upcoming_free}
+    elif work_active:
+        return {"type": "ARBEITSTAG", "label": WEEKDAY_DE[weekday],
+                "training_window": "Ab 16:30 Uhr", "double_session": False,
+                "note": "Arbeitstag — ab 16:30 Uhr trainingsfähig",
+                "upcoming_free_days": upcoming_free}
     else:
-        return {
-            "type": "FREI_POST_ARBEIT",
-            "label": WEEKDAY_DE[weekday],
-            "training_window": "Ganztags (nach 17. Juli)",
-            "double_session": True,
-            "note": "Voller Trainingstag möglich",
-            "upcoming_free_days": upcoming_free,
-        }
+        return {"type": "FREI", "label": WEEKDAY_DE[weekday],
+                "training_window": "Ganztags", "double_session": True,
+                "note": "Voller Trainingstag", "upcoming_free_days": upcoming_free}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 def get_events_context(today_date: datetime.date) -> list:
-    """
-    Events-Konfiguration. Neue Events einfach in der Liste eintragen.
-    Gibt für jedes Event Countdown, Phase und Ziel zurück.
-    """
-
-    # ── EVENTS — hier eintragen ───────────────────────────────────────────────
+    """Events-Konfiguration — neue Events hier eintragen."""
     events_config = [
-        {
-            "name": "IfA Nonstop Triathlon Bamberg",
-            "emoji": "🏊🚴🏃",
-            "date": datetime.date(2026, 6, 7),
-            "location": "Ebinger See, Rattelsdorf bei Bamberg",
-            "type": "sprint_triathlon",
-            "distance": "750m Schwimmen / 21km Radfahren / 5km Laufen",
-            "goal": "Finishen + Spaß. Zielzeit ~1:32 (Swim 20min / Bike 38min / Run 30min).",
-            "taper_days": 7,
-            "taper_style": "LEICHT — Kein Ultra-Taper. Volumen max 40% reduzieren. Hannes soll frisch aber nicht eingerostet ankommen.",
-            "disciplines": ["swim", "bike", "run"],
-            "critical_notes": [
-                "Schwimmen ist die vernachlässigte Disziplin — wenn >7 Tage kein Training: ROTE WARNUNG",
-                "Mind. 2 Brick-Einheiten (Rad + direkt Lauf) vor dem Rennen absolviert haben",
-                "Neopren im Freiwasser testen bevor Renntag",
-                "ACWR am Renntag: Ziel 0.8–1.0",
-            ],
-        },
-        {
-            "name": "Halbmarathon (Geburtstag 🎂)",
-            "emoji": "🏃",
-            "date": datetime.date(2026, 7, 12),
-            "location": "München (konkrete Veranstaltung TBD)",
-            "type": "halfmarathon",
-            "distance": "21.1km",
-            "goal": "ADAPTIV: Basis-Ziel sub 2:00h (5:41/km). ABER: wenn VO2max-Trend + aktuelle Pace-Daten eine schnellere Zeit realistisch machen, Ziel dynamisch nach unten anpassen. Kein hartes Kratzen an der 2h-Grenze.",
-            "goal_time_seconds": 7200,
-            "goal_pace_per_km": "5:41/km",
-            "taper_days": 10,
-            "taper_style": "NORMAL — 10 Tage Taper, Volumen 30-40% reduzieren, Intensität halten.",
-            "disciplines": ["run"],
-            "critical_notes": [
-                "Geburtstag von Hannes — soll Spaß machen",
-                "Nach Bamberg (7. Juni) hat er 5 Wochen gezielten HM-Aufbau",
-                "Wenn 5km-PR-Pace eine sub-1:50 HM impliziert → Ziel auf 1:50 anpassen",
-            ],
-        },
-        # Weitere Events hier eintragen:
-        # {
-        #     "name": "Name",
-        #     "emoji": "🏁",
-        #     "date": datetime.date(2026, 9, 15),
-        #     "location": "Ort",
-        #     "type": "typ",
-        #     "distance": "Strecke",
-        #     "goal": "Ziel",
-        #     "taper_days": 7,
-        #     "taper_style": "...",
-        #     "disciplines": ["run"],
-        #     "critical_notes": [],
-        # },
+        {"name": "IfA Nonstop Triathlon Bamberg", "emoji": "🏊🚴🏃",
+         "date": datetime.date(2026, 6, 7), "location": "Ebinger See, Rattelsdorf",
+         "type": "sprint_triathlon", "distance": "750m / 21km / 5km",
+         "goal": "Finishen + Spaß. Zielzeit ~1:32.", "taper_days": 7,
+         "taper_style": "LEICHT — kein Ultra-Taper, max 40% Volumenreduktion",
+         "disciplines": ["swim","bike","run"],
+         "critical_notes": ["Schwimmen: >7 Tage keine Session → ROTE WARNUNG",
+                            "Mind. 2 Brick-Einheiten vor Renntag",
+                            "Neopren im Freiwasser testen (Decathlon Surfanzug 4/3mm)"]},
+        {"name": "Halbmarathon Geburtstag 🎂", "emoji": "🏃",
+         "date": datetime.date(2026, 7, 12), "location": "München (TBD)",
+         "type": "halfmarathon", "distance": "21.1km",
+         "goal": "ADAPTIV: Basis sub 2:00h (5:41/km). Wenn Fitness besser → Ziel nach unten anpassen.",
+         "taper_days": 10, "taper_style": "NORMAL — 10 Tage, 30-40% Volumenreduktion",
+         "disciplines": ["run"],
+         "critical_notes": ["5 Wochen HM-Aufbau nach Bamberg", "Ziel dynamisch anpassen"]},
+        # Weitere Events:
+        # {"name":"...", "emoji":"🏁", "date": datetime.date(2026,9,1), ...}
     ]
-
     result = []
     for ev in events_config:
         days_left = (ev["date"] - today_date).days
-        if days_left < -2:
-            continue  # Überspringe Events die >2 Tage zurückliegen
-
+        if days_left < -2: continue
         if days_left < 0:               phase = "GERADE VORBEI"
         elif days_left == 0:            phase = "HEUTE 🔴🔴🔴"
         elif days_left <= 6:            phase = "RACE WEEK 🔴"
-        elif days_left <= ev["taper_days"]: phase = "TAPER PHASE 🟡"
+        elif days_left <= ev["taper_days"]: phase = "TAPER 🟡"
         elif days_left <= 14:           phase = "RACE SHARPENING 🟡"
         elif days_left <= 35:           phase = "Spezifische Vorbereitung 🟢"
         else:                           phase = "Basisaufbau 🟢"
-
         result.append({**ev, "days_left": days_left, "phase": phase,
-                       "date_str": ev["date"].strftime("%d. %B %Y")})
+                        "date_str": ev["date"].strftime("%d. %B %Y")})
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-def generate_dashboard(garmin_data: dict) -> str:
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. WORKOUT ENTSCHEIDUNG (Claude Call 1 — klein, schnell)
+# ═════════════════════════════════════════════════════════════════════════════
+def generate_workout_plan(metrics: dict, day_ctx: dict, events: list) -> dict:
     """
-    Baut alle Kontextinformationen auf, schickt sie an Claude,
-    bekommt fertiges HTML-Dashboard zurück.
+    Claude entscheidet was heute trainiert wird und gibt strukturiertes JSON zurück.
+    Dieses JSON wird direkt in build_garmin_workout() verwendet.
     """
     client     = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    today      = datetime.date.today()
-    today_str  = today.strftime("%A, %d. %B %Y")
+    today_str  = datetime.date.today().strftime("%A, %d. %B %Y")
 
-    # ── Kontext aufbauen ─────────────────────────────────────────────────────
-    metrics    = extract_fresh_metrics(garmin_data)
-    day_ctx    = get_day_context(today)
-    events     = get_events_context(today)
+    sleep     = metrics.get("sleep", {})
+    hrv       = metrics.get("hrv", {})
+    readiness = metrics.get("readiness", {})
+    tl        = metrics.get("training_load", {})
+    bb        = metrics.get("body_battery_now","unbekannt")
 
-    # ── Schwimm-Warnung berechnen ─────────────────────────────────────────────
-    last_swim  = metrics.get("last_swim", {})
-    swim_days_ago = (last_swim.get("days_ago") or 999) if last_swim else 999
-    swim_warning = ""
-    if swim_days_ago >= 14:
-        swim_warning = f"🚨 KRITISCH: Letztes Schwimmen vor {swim_days_ago} Tagen! Bamberg in {next((e['days_left'] for e in events if 'triathlon' in e.get('type','')), '?')} Tagen."
-    elif swim_days_ago >= 7:
-        swim_warning = f"⚠️ WARNUNG: Letztes Schwimmen vor {swim_days_ago} Tagen. Dringend wieder ins Wasser."
+    last_swim = metrics.get("last_swim")
+    last_run  = metrics.get("last_run")
+    last_bike = metrics.get("last_bike")
 
-    # ── Metriken als lesbarer String ─────────────────────────────────────────
-    metrics_str = json.dumps(metrics, indent=2, ensure_ascii=False)
+    events_str = "\n".join([
+        f"- {ev['name']}: noch {ev['days_left']} Tage ({ev['phase']})"
+        for ev in events
+    ])
 
-    # ── Events als lesbarer String ────────────────────────────────────────────
-    events_str = ""
-    for ev in events:
-        events_str += f"""
-╔══ {ev['emoji']} {ev['name']} ══
-║  Datum: {ev['date_str']} | Noch: {ev['days_left']} Tage | Phase: {ev['phase']}
-║  Ort: {ev['location']}
-║  Strecke: {ev['distance']}
-║  Ziel: {ev['goal']}
-║  Taper: {ev['taper_style']}
-║  Wichtige Hinweise:
-"""
-        for note in ev.get("critical_notes", []):
-            events_str += f"║  • {note}\n"
-        events_str += "╚══\n"
+    prompt = f"""Du bist Sports Scientist für Hannes Raschke (20J, Triathlet).
+Heute: {today_str} | Tagestyp: {day_ctx['type']} — {day_ctx['note']}
 
-    # ── Freie Tage als String ─────────────────────────────────────────────────
-    free_days = day_ctx.get("upcoming_free_days", [])
-    free_days_str = ", ".join(
-        f"{d['weekday']} {d['date']} ({d['name']}, in {d['days_from_now']}d)"
-        for d in free_days[:5]
-    ) or "Keine in den nächsten 10 Tagen"
+AKTUELLE METRIKEN:
+Sleep Score: {sleep.get('score','?')} ({sleep.get('freshness','')})
+HRV letzte Nacht: {hrv.get('last_night_ms','?')} ms | Wochenschnitt: {hrv.get('weekly_avg_ms','?')} ms ({hrv.get('freshness','')})
+Training Readiness: {readiness.get('score','?')} [{readiness.get('level','')}] ({readiness.get('freshness','')})
+Body Battery: {bb}
+ATL/CTL/ACWR: {tl.get('atl','?')} / {tl.get('ctl','?')} / {tl.get('acwr','?')}
 
-    # ── Aktivitäten (letzte 10) für Überblick ─────────────────────────────────
-    acts = garmin_data.get("activities", [])[:10]
-    acts_str = json.dumps(acts, indent=1, default=str, ensure_ascii=False)
-    if len(acts_str) > 8000:
-        acts_str = acts_str[:8000] + "..."
+LETZTE SESSIONS:
+Schwimmen: {f"{last_swim['days_ago']} Tage her ({last_swim['distance_m']}m)" if last_swim else 'keine Daten'}
+Laufen: {f"{last_run['days_ago']} Tage her ({last_run['distance_m']}m)" if last_run else 'keine Daten'}
+Radfahren: {f"{last_bike['days_ago']} Tage her ({last_bike['distance_m']}m)" if last_bike else 'keine Daten'}
 
-    # ── Sleep (letzte 7) für Tabellenansicht ─────────────────────────────────
-    sleep_str = json.dumps(garmin_data.get("sleep", [])[:7], indent=1,
-                           default=str, ensure_ascii=False)
-    if len(sleep_str) > 5000:
-        sleep_str = sleep_str[:5000] + "..."
-
-    # ── Prompt ───────────────────────────────────────────────────────────────
-    prompt = f"""Du bist der persönliche Ausdauer-Coach und Sports Scientist von Hannes Raschke.
-Jetzt generierst du sein tägliches Dashboard für {today_str}.
-
-═══ HANNES' PROFIL ═══
-- 20 Jahre, 182cm, 81.8kg | Garmin Forerunner 965
-- HFmax: 196 bpm | Z2: 118–137 bpm | Schwelle: 176 bpm | Z5 VO2max: >176 bpm
-- VO2max Laufen: 47 | Biometrisch: 50.6 (Lücke = fehlende Z2-Basis)
-- Kern-Problem: 79% der Laufzeit in Z4, 0% in Z2 → muss geändert werden
-- FTP Real: 216W (Garmin zeigt 363W — ignorieren)
-- 5km PR: 26:58 (5:24/km) vom 15. April 2026
-{swim_warning}
-
-═══ HEUTIGER TAG ═══
-Typ: {day_ctx['type']} ({day_ctx['label']})
-Trainingsfenster: {day_ctx['training_window']}
-Doppeleinheit möglich: {'Ja' if day_ctx['double_session'] else 'Nein'}
-Hinweis: {day_ctx['note']}
-Nächste freie Tage: {free_days_str}
-
-═══ FRISCHESTE METRIKEN (mit Datum) ═══
-{metrics_str}
-
-═══ LETZTE 10 AKTIVITÄTEN ═══
-{acts_str}
-
-═══ SCHLAF LETZTE 7 NÄCHTE (Rohdaten) ═══
-{sleep_str}
-
-═══ KOMMENDE EVENTS ═══
+EVENTS:
 {events_str}
 
-═══ DEINE AUFGABE ═══
+HANNES' PROFIL:
+HFmax 196 bpm | Z2: 118-137 bpm | Schwelle: 176 bpm | Z5: >176 bpm
+PROBLEM: 79% Laufzeit in Z4, 0% in Z2 — Fokus auf echte Z2-Läufe und VO2max-Intervalle
+ACWR: <0.8=zu wenig, 0.8-1.3=optimal, >1.3=Vorsicht
 
-Erstelle ein vollständiges, standalone HTML-Dashboard. Das Dashboard soll sich INTELLIGENT an den Tag anpassen — nicht jede Sektion immer zeigen, sondern nur was heute wirklich relevant ist.
+Entscheide jetzt das heutige Training. Antworte AUSSCHLIESSLICH mit diesem JSON-Format
+(kein Markdown, kein Text davor/danach):
 
-PFLICHT-DESIGN:
-- Kein externes CSS/JS/CDN — alles inline
-- Mobil-first: optimiert für 375–430px Breite (iPhone)
-- Dunkel: Hintergrund #080c08 | Grün #4cff7c | Amber #ffb84c | Rot #ff6060 | Text #ddeedd | Cards #0f140f
-- Schrift: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif
-- Sections mit max-width: 480px; margin: 0 auto; padding: 16px
+{{
+  "decision": "TRAIN",
+  "reason": "2-3 Sätze mit echten Werten aus den Metriken",
+  "workout": {{
+    "sport": "running",
+    "name": "Workout-Name max 40 Zeichen",
+    "description": "Kurzbeschreibung für Garmin Connect",
+    "steps": [
+      {{
+        "phase": "warmup",
+        "name": "Warm-Up Z2",
+        "end_type": "distance",
+        "end_value": 2000,
+        "end_unit": "meter",
+        "hr_min": 118,
+        "hr_max": 137,
+        "repeats": 1
+      }}
+    ]
+  }}
+}}
 
-STRUKTUR — IN DIESER REIHENFOLGE:
+ODER bei Ruhetag:
+{{"decision": "REST", "reason": "Begründung", "workout": null}}
 
-─── HEADER ───
-"Guten Morgen, Hannes" + heutiges Datum + Wochentag
-Klein, dezent, eine Zeile.
-Falls es ein Feiertag oder Wochenende ist: kurzen freundlichen Hinweis.
+STEP-REGELN:
+- phase-Werte: "warmup", "interval", "recovery", "cooldown", "active"
+- end_type: "distance" (end_value in Metern) oder "time" (end_value in Sekunden)
+- repeats: für Intervalle+Erholung gleiche Zahl setzen (z.B. beide repeats=4)
+- Wiederholungsgruppen: interval-Schritt + recovery-Schritt mit gleichen repeats
+- warmup/cooldown/active: repeats=1
 
-─── METRIKEN (immer, ganz oben) ───
-Alle verfügbaren Tageswerte als Grid. Für jede Metrik:
-• Große Zahl + Einheit
-• Label darunter
-• Ampelfarbe: Grün / Amber / Rot basierend auf Schwellenwerten
-• Datum/Freshness-Label (z.B. "heute nacht" / "gestern")
+BEISPIELE:
+Z2 Lauf 10km: [{{"phase":"active","name":"Z2 Lauf","end_type":"distance","end_value":10000,"end_unit":"meter","hr_min":118,"hr_max":137,"repeats":1}}]
 
-Zeige NUR was Daten hat — keine leeren Felder.
-Empfohlene Metriken falls vorhanden:
-Sleep Score | HRV (letzte Nacht ms + Wochenschnitt) | Training Readiness Score + Level
-Body Battery | Ruheherzfrequenz | ACWR
+4x4min Intervalle: [
+  {{"phase":"warmup","name":"Warm-Up","end_type":"distance","end_value":2000,"end_unit":"meter","hr_min":118,"hr_max":137,"repeats":1}},
+  {{"phase":"interval","name":"VO2max Intervall","end_type":"time","end_value":240,"end_unit":"second","hr_min":167,"hr_max":177,"repeats":4}},
+  {{"phase":"recovery","name":"Trabpause","end_type":"time","end_value":180,"end_unit":"second","hr_min":100,"hr_max":118,"repeats":4}},
+  {{"phase":"cooldown","name":"Cool-Down","end_type":"distance","end_value":1500,"end_unit":"meter","hr_min":118,"hr_max":137,"repeats":1}}
+]
 
-Ampel-Schwellen:
-Sleep: ≥85=grün, 70-84=amber, <70=rot
-HRV: ≥63ms=grün, 50-62=amber, <50=rot (Basis Hannes: 57-61ms)
-Readiness: ≥80=grün, 60-79=amber, <60=rot
-Body Battery: ≥70=grün, 40-69=amber, <40=rot
-RHR: ≤58=grün, 59-64=amber, ≥65=rot
-ACWR: 0.8-1.3=grün, <0.8=amber, >1.3=rot
+8x1min: repeats=8, end_value=60 für interval, end_value=90 für recovery
 
-─── TAGES-EMPFEHLUNG (immer) ───
-Groß + farbig + konkret. NICHT generisch.
-Format:
-[🟢/🟡/🔴] [HEUTE: Session-Titel]
-Begründung in 2 Sätzen mit echten Zahlenwerten aus den Metriken.
-Konkrete Session:
-  • Typ + Distanz/Dauer
-  • HR-Zonen in bpm
-  • 
-  • Falls FREIER TAG: darf länger sein, Doppeleinheit falls sinnvoll
+Swim sport="swimming", Bike sport="cycling"
+Bei Brick: wähle den Haupt-Sport (meist cycling), beschreibe Run im description-Feld"""
 
-─── NÄCHSTE 5 TAGE ───
-Für jeden Tag:
-Wochentag Datum | [FREI/ARBEIT/FEIERTAG] | Geplante Session | Intensität
-Berücksichtige:
-• Freie Tage (Wochenende/Feiertag) → längere/härtere Sessions möglich
-• Arbeitstage → max 75 min ab 16:30
-• Nach hartem Tag: Erholung einplanen
-• Event-Phasen: wenn Taper → Volumen reduzieren
-• Schwimmen priorisieren wenn Bamberg <35 Tage weg und >5 Tage kein Schwimmen
+    message = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = message.content[0].text.strip()
+    if text.startswith("```"):
+        text = "\n".join(text.split("\n")[1:])
+        if "```" in text:
+            text = text.rsplit("```", 1)[0]
+    return json.loads(text.strip())
 
-─── EVENTS (immer, kompakt) ───
-Für jedes Event eine Karte:
-[Emoji + Name] — [X TAGE] — [Phase]
-Disziplin-Ampeln (basierend auf days_ago der letzten Session):
-🏊 Swim: <5 Tage=grün, 5-10=amber, >10=rot
-🚴 Bike: <7 Tage=grün, 7-14=amber, >14=rot
-🏃 Run:  <4 Tage=grün, 4-7=amber, >7=rot
-Fokus dieser Woche: 1-2 Sätze was jetzt am wichtigsten ist.
-HM-Ziel adaptiv: wenn aktuelle Pace-Daten eine schnellere Zeit implizieren, zeige angepasstes Ziel.
 
-─── SCHLAF LETZTE 7 NÄCHTE (kompakt) ───
-Kompakte Tabelle: Datum | Score | Dauer | REM | SpO2-Min
-Beste Nacht grün, schlechteste rot markieren.
-Nur zeigen wenn ≥3 Nächte vorhanden.
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. WORKOUT IN GARMIN-FORMAT KONVERTIEREN
+# ═════════════════════════════════════════════════════════════════════════════
+def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
+    """
+    Konvertiert das vereinfachte Step-Format in Garmins natives API-Format.
+    Unterstützt: einfache Schritte + Wiederholungsgruppen (Intervall+Erholung).
+    """
+    SPORT_TYPES = {
+        "running":  {"sportTypeId": 1,  "sportTypeKey": "running"},
+        "cycling":  {"sportTypeId": 2,  "sportTypeKey": "cycling"},
+        "swimming": {"sportTypeId": 5,  "sportTypeKey": "lap_swimming"},
+        "other":    {"sportTypeId": 4,  "sportTypeKey": "other"},
+    }
+    STEP_TYPES = {
+        "warmup":   {"stepTypeId": 1, "stepTypeKey": "warmup"},
+        "cooldown": {"stepTypeId": 2, "stepTypeKey": "cooldown"},
+        "interval": {"stepTypeId": 3, "stepTypeKey": "interval"},
+        "recovery": {"stepTypeId": 4, "stepTypeKey": "recovery"},
+        "active":   {"stepTypeId": 3, "stepTypeKey": "interval"},
+        "rest":     {"stepTypeId": 5, "stepTypeKey": "rest"},
+    }
+    END_COND = {
+        "distance": {"conditionTypeId": 3, "conditionTypeKey": "distance"},
+        "time":     {"conditionTypeId": 2, "conditionTypeKey": "time"},
+    }
+    HR_TARGET = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone"}
+    NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target"}
 
-─── LETZTE 7 TRAININGS (kompakt) ───
-Kompakte Liste: Datum | Typ | Distanz | Dauer | Ø HR
-Nur wenn vorhanden.
+    sport      = workout_plan.get("sport", "running")
+    sport_type = SPORT_TYPES.get(sport, SPORT_TYPES["running"])
+    steps_in   = workout_plan.get("steps", [])
 
-─── TRAINING LOAD (nur wenn ACWR-Daten vorhanden) ───
-ATL | CTL | ACWR — Ampel + 1 Satz Interpretation.
+    def make_exec_step(step, order):
+        phase   = step.get("phase","active")
+        et      = step.get("end_type","distance")
+        ev      = step.get("end_value", 1000)
+        hr_min  = step.get("hr_min")
+        hr_max  = step.get("hr_max")
+        return {
+            "type": "ExecutableStepDTO",
+            "stepOrder": order,
+            "stepType": STEP_TYPES.get(phase, STEP_TYPES["interval"]),
+            "description": step.get("name",""),
+            "endCondition": END_COND.get(et, END_COND["distance"]),
+            "endConditionValue": ev,
+            "targetType": HR_TARGET if (hr_min and hr_max) else NO_TARGET,
+            "targetValueOne":  hr_min or 0,
+            "targetValueTwo":  hr_max or 0,
+            "childStepId": None,
+        }
 
-INTELLIGENZ-REGELN:
-• Wenn ACWR > 1.4: Erholungswarnung prominent ganz oben zeigen
-• Wenn Readiness < 50: Ruhepflicht-Banner
-• Wenn <7 Tage bis Event: Race-Week-Banner ersetze die normale Empfehlung
-• Wenn eine Disziplin rot ist und <14 Tage bis Rennen: Warnung in Event-Karte
-• Wenn HM-Pace-Hochrechnung (aus 5km PR 26:58) schneller als sub-2h: adaptiertes Ziel zeigen
+    # Gruppiere Schritte nach repeats-Zahl
+    # Schritte mit repeats>1 und gleicher Zahl → RepeatGroup
+    garmin_steps = []
+    order = 1
+    i = 0
+    while i < len(steps_in):
+        step = steps_in[i]
+        rep  = step.get("repeats", 1)
 
-STIL-REGELN:
-• Cards: border-radius: 12px; padding: 16px; margin: 10px 0; background: #0f140f; border: 1px solid #1c261c
-• Große KPI-Zahlen: font-size: 28-32px; font-weight: 700
-• Section-Titel: font-size: 11px; text-transform: uppercase; letter-spacing: 0.12em; color: #3a5a3a
-• Ampel-Farben auch als kleine Punkte (●) vor Werten
+        if rep > 1:
+            # Sammle alle Schritte mit gleicher repeats-Zahl
+            group_steps = []
+            while i < len(steps_in) and steps_in[i].get("repeats",1) == rep:
+                group_steps.append(steps_in[i])
+                i += 1
 
-Antworte AUSSCHLIESSLICH mit vollständigem HTML. Direkt mit <!DOCTYPE html> beginnen."""
+            inner_steps = []
+            inner_order = order + 1
+            for gs in group_steps:
+                inner_steps.append(make_exec_step(gs, inner_order))
+                inner_order += 1
+
+            repeat_group = {
+                "type": "RepeatGroupDTO",
+                "stepOrder": order,
+                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat"},
+                "numberOfIterations": rep,
+                "smartRepeat": False,
+                "childStepId": order + 1,
+                "endCondition": {"conditionTypeId": 7, "conditionTypeKey": "iterations"},
+                "endConditionValue": None,
+                "workoutSteps": inner_steps,
+            }
+            garmin_steps.append(repeat_group)
+            order = inner_order
+        else:
+            garmin_steps.append(make_exec_step(step, order))
+            order += 1
+            i += 1
+
+    return {
+        "workoutName": workout_plan.get("name", f"Training {today.isoformat()}"),
+        "description": workout_plan.get("description",""),
+        "sportType":   sport_type,
+        "workoutSegments": [{
+            "segmentOrder": 1,
+            "sportType":    sport_type,
+            "workoutSteps": garmin_steps,
+        }],
+    }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. WORKOUT IN GARMIN CONNECT HOCHLADEN
+# ═════════════════════════════════════════════════════════════════════════════
+def upload_workout_to_garmin(client: Garmin, workout_dict: dict,
+                             today: datetime.date) -> dict:
+    """
+    Lädt Workout hoch + plant es für heute.
+    Gibt Status-Dict zurück das im Dashboard angezeigt wird.
+    """
+    try:
+        print("   Workout wird hochgeladen...")
+        result = client.add_workout(workout_dict)
+
+        if result is None:
+            return {"success": False, "workout_id": None,
+                    "message": "Garmin API hat keine Antwort zurückgegeben"}
+
+        # Workout-ID extrahieren
+        workout_id = None
+        if isinstance(result, dict):
+            workout_id = (result.get("workoutId") or result.get("id")
+                          or result.get("workout_id"))
+        elif isinstance(result, (int, str)):
+            try: workout_id = int(result)
+            except: pass
+
+        print(f"   Workout erstellt — ID: {workout_id}")
+
+        if workout_id:
+            # Für heute planen
+            try:
+                client.schedule_workout(workout_id, today.isoformat())
+                print(f"   ✓ Für heute ({today.isoformat()}) geplant")
+                return {
+                    "success": True,
+                    "workout_id": workout_id,
+                    "message": f"Workout erstellt und für heute geplant ✓",
+                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
+                }
+            except Exception as sched_err:
+                print(f"   Scheduling Fehler (harmlos): {sched_err}")
+                return {
+                    "success": True,
+                    "workout_id": workout_id,
+                    "message": f"Workout erstellt ✓ (Garmin Connect → Trainings → Meine Workouts)",
+                    "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
+                }
+        else:
+            return {
+                "success": True,
+                "workout_id": None,
+                "message": "Workout erstellt ✓ (Garmin Connect → Trainings → Meine Workouts)"
+            }
+
+    except Exception as e:
+        print(f"   Workout-Upload Fehler: {e}")
+        return {
+            "success": False,
+            "workout_id": None,
+            "message": f"Upload fehlgeschlagen: {str(e)[:120]}"
+        }
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. HTML DASHBOARD GENERIEREN (Claude Call 2 — Haupt-Dashboard)
+# ═════════════════════════════════════════════════════════════════════════════
+def generate_dashboard(garmin_data: dict, metrics: dict, day_ctx: dict,
+                       events: list, workout_plan: dict, workout_status: dict) -> str:
+    """
+    Generiert das vollständige HTML-Dashboard mit eingebetteter Workout-Bestätigung.
+    """
+    client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    today     = datetime.date.today()
+    today_str = today.strftime("%A, %d. %B %Y")
+
+    # Swim-Warnung
+    last_swim     = metrics.get("last_swim", {})
+    swim_days_ago = (last_swim.get("days_ago") or 999) if last_swim else 999
+    swim_warning  = ""
+    for ev in events:
+        if "triathlon" in ev.get("type",""):
+            days_to_race = ev["days_left"]
+            if swim_days_ago >= 14:
+                swim_warning = f"🚨 KRITISCH: {swim_days_ago} Tage kein Schwimmen! Bamberg in {days_to_race} Tagen."
+            elif swim_days_ago >= 7:
+                swim_warning = f"⚠️ {swim_days_ago} Tage kein Schwimmen. Dringend ins Wasser."
+
+    # Workout-Status für Dashboard
+    if workout_plan.get("decision") == "REST":
+        workout_banner = f"""
+WORKOUT HEUTE: RUHETAG
+Begründung: {workout_plan.get('reason','')}
+Garmin: Kein Workout hochgeladen."""
+    elif workout_status.get("success"):
+        w = workout_plan.get("workout", {})
+        steps_summary = " → ".join(
+            f"{s.get('phase')} {s.get('end_value')}{s.get('end_unit','')}"
+            + (f"x{s.get('repeats')}" if s.get("repeats",1)>1 else "")
+            for s in w.get("steps",[])
+        )
+        workout_banner = f"""
+WORKOUT HEUTE: ✅ IN GARMIN CONNECT HOCHGELADEN
+Name: {w.get('name','')}
+Sport: {w.get('sport','')}
+Struktur: {steps_summary}
+Begründung: {workout_plan.get('reason','')}
+Status: {workout_status.get('message','')}"""
+        if workout_status.get("garmin_link"):
+            workout_banner += f"\nLink: {workout_status['garmin_link']}"
+    else:
+        w = workout_plan.get("workout", {}) or {}
+        workout_banner = f"""
+WORKOUT HEUTE: ⚠️ UPLOAD FEHLGESCHLAGEN
+Name: {w.get('name','unbekannt')}
+Begründung: {workout_plan.get('reason','')}
+Fehler: {workout_status.get('message','')}
+Manuelle Alternative: Session wie unten beschrieben selbst starten."""
+
+    # Events string
+    events_str = ""
+    for ev in events:
+        events_str += (f"\n{ev['emoji']} {ev['name']}: noch {ev['days_left']} Tage"
+                       f" | Phase: {ev['phase']}"
+                       f"\n  Strecke: {ev['distance']} | Ziel: {ev['goal']}"
+                       f"\n  Taper: {ev['taper_style']}\n")
+
+    # Freie Tage
+    free_str = ", ".join(
+        f"{d['weekday']} ({d['name']}, in {d['days_from_now']}d)"
+        for d in day_ctx.get("upcoming_free_days",[])[:4]
+    ) or "keine in 10 Tagen"
+
+    # Daten
+    acts_str  = json.dumps(garmin_data.get("activities",[])[:10], indent=1, default=str)[:6000]
+    sleep_str = json.dumps(garmin_data.get("sleep",[])[:7], indent=1, default=str)[:4000]
+    metr_str  = json.dumps(metrics, indent=2, ensure_ascii=False)
+
+    prompt = f"""Du bist der persönliche Coach von Hannes Raschke.
+Erstelle sein tägliches HTML-Dashboard für {today_str}.
+{swim_warning}
+
+TAGESKONTEXT:
+Typ: {day_ctx['type']} | {day_ctx['note']}
+Nächste freie Tage: {free_str}
+
+FRISCHE METRIKEN:
+{metr_str}
+
+{workout_banner}
+
+EVENTS:
+{events_str}
+
+LETZTE 10 AKTIVITÄTEN:
+{acts_str}
+
+SCHLAF LETZTE 7 NÄCHTE:
+{sleep_str}
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+ERSTELLE EIN VOLLSTÄNDIGES STANDALONE HTML-DASHBOARD.
+Kein externes CSS/JS/CDN. Alles inline. Mobil-first (375px).
+Hintergrund #080c08 | Grün #4cff7c | Amber #ffb84c | Rot #ff6060 | Text #ddeedd
+Schrift: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif
+
+PFLICHT-REIHENFOLGE:
+
+[1] HEADER — "Guten Morgen Hannes — {today_str}" (dezent, eine Zeile)
+
+[2] METRIKEN — alle verfügbaren Tageswerte, große Zahlen, Ampelfarben:
+Sleep Score | HRV letzte Nacht ms | Training Readiness | Body Battery | RHR | ACWR
+Ampeln: Sleep≥85=grün,70-84=amber,<70=rot | HRV≥63=grün,50-62=amber,<50=rot
+Readiness≥80=grün,60-79=amber | BB≥70=grün,40-69=amber | RHR≤58=grün,>65=rot
+ACWR 0.8-1.3=grün | Freshness-Label unter jedem Wert ("heute nacht","gestern" etc.)
+
+[3] WORKOUT GARMIN STATUS — prominent, farbige Box:
+Falls Upload erfolgreich (✅): Grüne Box — Workout-Name + Sport + HR-Zonen + Kurzstruktur
+  + "Workout ist in Garmin Connect — sync Uhr um es zu starten"
+Falls REST (🔴): Rote Box — "Ruhetag" + Begründung
+Falls Fehler (⚠️): Amber Box — Session-Beschreibung + Hinweis manuell starten
+
+[4] TAGES-EMPFEHLUNG — ergänzende Details zur Session:
+Konkrete HR-Zonen in bpm, Struktur, Tipps für die heutige Session
+
+[5] NÄCHSTE 5 TAGE — Trainingsvorschau:
+Für jeden Tag: Wochentag | Tagestyp | Geplante Session | Intensität
+Freie Tage dürfen längere/härtere Sessions haben
+
+[6] EVENTS — kompakte Karten:
+Name | Tage | Phase | Disziplin-Ampeln (🏊🚴🏃 je nach days_ago)
+Fokus: was ist jetzt wichtigste Aufgabe für dieses Event
+
+[7] SCHLAF LETZTE 7 NÄCHTE — kompakte Tabelle
+
+[8] LETZTE 7 TRAININGS — kompakte Liste
+
+[9] TRAINING LOAD — ATL/CTL/ACWR wenn vorhanden
+
+Wenn ACWR>1.4: Warnung oben als roter Banner.
+Wenn Readiness<50: Ruhe-Banner über allem anderen.
+Wenn Race Week (<7d): Race-Week-Banner statt normale Empfehlung.
+
+Antworte AUSSCHLIESSLICH mit vollständigem HTML. Direkt <!DOCTYPE html>."""
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8000,
         messages=[{"role": "user", "content": prompt}]
     )
-
     html = message.content[0].text.strip()
     if html.startswith("```"):
-        html = html.split("\n", 1)[1]
-        if html.endswith("```"):
-            html = html.rsplit("```", 1)[0]
+        html = "\n".join(html.split("\n")[1:])
+        if "```" in html:
+            html = html.rsplit("```",1)[0]
     return html.strip()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. E-MAIL SENDEN
+# ═════════════════════════════════════════════════════════════════════════════
 def send_email(html_content: str, date_str: str):
-    """Sendet das Dashboard als HTML-E-Mail via iCloud SMTP."""
-
     msg            = MIMEMultipart("alternative")
     msg["Subject"] = f"🏃 {date_str} — Garmin Dashboard"
     msg["From"]    = GMAIL_USER
     msg["To"]      = GMAIL_TO
-
-    plain = MIMEText(
-        f"Dein Garmin Dashboard für {date_str}. "
-        "Öffne diese E-Mail in einem HTML-fähigen Client.",
-        "plain", "utf-8"
-    )
-    msg.attach(plain)
-    msg.attach(MIMEText(html_content, "html", "utf-8"))
-
+    msg.attach(MIMEText(
+        f"Dein Garmin Dashboard für {date_str}. HTML-fähigen Client öffnen.",
+        "plain","utf-8"))
+    msg.attach(MIMEText(html_content, "html","utf-8"))
     with smtplib.SMTP("smtp.mail.me.com", 587) as server:
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
+        server.ehlo(); server.starttls(); server.ehlo()
         server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
         server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═════════════════════════════════════════════════════════════════════════════
 def main():
-    today_str = datetime.date.today().strftime("%d. %m. %Y")
-    print(f"\n{'='*52}")
-    print(f"  Garmin Daily Dashboard — {today_str}")
-    print(f"{'='*52}\n")
+    today     = datetime.date.today()
+    today_str = today.strftime("%d. %m. %Y")
+    print(f"\n{'='*54}")
+    print(f"  Garmin Daily Dashboard + Workout — {today_str}")
+    print(f"{'='*54}\n")
 
     try:
-        print("1/3 — Garmin-Daten laden...")
-        garmin_data = get_garmin_data()
-        print(f"   ✓ Daten geladen\n")
+        # ── 1. Login (einmalig, für Lesen + Schreiben) ────────────────────────
+        print("1/6 — Garmin Login...")
+        garmin_client = get_garmin_client()
 
-        print("2/3 — Claude generiert Dashboard...")
-        html_dashboard = generate_dashboard(garmin_data)
-        print(f"   ✓ Dashboard fertig ({len(html_dashboard):,} Zeichen)\n")
+        # ── 2. Daten laden ────────────────────────────────────────────────────
+        print("2/6 — Daten laden...")
+        garmin_data = get_garmin_data(garmin_client)
 
-        print("3/3 — E-Mail senden...")
+        # ── 3. Kontext ────────────────────────────────────────────────────────
+        print("3/6 — Kontext aufbauen...")
+        metrics  = extract_fresh_metrics(garmin_data)
+        day_ctx  = get_day_context(today)
+        events   = get_events_context(today)
+        print(f"   Tagestyp: {day_ctx['type']} | Events: {len(events)}")
+
+        # ── 4. Workout-Entscheidung ───────────────────────────────────────────
+        print("4/6 — Claude entscheidet Workout...")
+        workout_plan = generate_workout_plan(metrics, day_ctx, events)
+        decision     = workout_plan.get("decision","REST")
+        print(f"   Entscheidung: {decision}")
+        if decision == "TRAIN" and workout_plan.get("workout"):
+            print(f"   Workout: {workout_plan['workout'].get('name','?')}")
+
+        # ── 5. Workout in Garmin hochladen ────────────────────────────────────
+        workout_status = {"success": False, "message": "Kein Training heute", "workout_id": None}
+        if decision == "TRAIN" and workout_plan.get("workout"):
+            print("5/6 — Workout in Garmin Connect hochladen...")
+            garmin_workout = build_garmin_workout(workout_plan["workout"], today)
+            workout_status = upload_workout_to_garmin(garmin_client, garmin_workout, today)
+            print(f"   Status: {workout_status['message']}")
+        else:
+            print("5/6 — Ruhetag, kein Workout-Upload")
+
+        # ── 6. Dashboard generieren ───────────────────────────────────────────
+        print("6/6 — Claude generiert Dashboard...")
+        html_dashboard = generate_dashboard(
+            garmin_data, metrics, day_ctx, events, workout_plan, workout_status
+        )
+        print(f"   Dashboard: {len(html_dashboard):,} Zeichen")
+
+        # ── E-Mail ────────────────────────────────────────────────────────────
         send_email(html_dashboard, today_str)
-        print(f"   ✓ Gesendet an {GMAIL_TO}\n")
-
-        print("✅ FERTIG — bis morgen!\n")
+        print(f"\n✅ FERTIG — E-Mail an {GMAIL_TO} gesendet\n")
 
     except Exception as e:
         print(f"\n❌ FEHLER: {e}")
         traceback.print_exc()
         try:
-            error_html = f"""<!DOCTYPE html>
-<html><body style="background:#1a0000;color:#ff8080;font-family:monospace;padding:20px">
-<h2>⚠️ Dashboard Fehler — {today_str}</h2>
-<pre style="background:#2a0000;padding:15px;border-radius:8px;white-space:pre-wrap">{traceback.format_exc()}</pre>
-</body></html>"""
-            send_email(error_html, today_str)
-        except:
-            pass
+            err_html = f"""<!DOCTYPE html><html><body
+              style="background:#1a0000;color:#ff8080;font-family:monospace;padding:20px">
+              <h2>⚠️ Dashboard Fehler — {today_str}</h2>
+              <pre style="background:#2a0000;padding:15px;border-radius:8px;
+              white-space:pre-wrap">{traceback.format_exc()}</pre></body></html>"""
+            send_email(err_html, today_str)
+        except: pass
         raise
 
 
