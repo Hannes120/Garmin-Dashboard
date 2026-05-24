@@ -2,16 +2,18 @@ name: Daily Garmin Dashboard
 
 on:
   schedule:
-    # Jeden Tag um 07:00 Uhr CEST (= 05:00 UTC im Sommer / UTC+2)
-    - cron: '15 4 * * *'
+    # Startet täglich um 05:00 CEST (03:00 UTC)
+    # Skript wartet dann intern bis Sleep Score verfügbar ist (max 90 min)
+    # → E-Mail kommt ~10 min nach deinem Aufwachen, egal wann das ist
+    - cron: '0 3 * * *'
 
-  # Manueller Start — für Tests direkt auf GitHub klicken
+  # Manueller Start für Tests
   workflow_dispatch:
 
 jobs:
   generate-dashboard:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 120   # 2h — Platz für Sleep-Polling + Verarbeitung
 
     steps:
       - name: Repository auschecken
@@ -21,12 +23,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          # Kein pip-Cache — stellt sicher dass immer frische Version geladen wird
 
       - name: Abhängigkeiten installieren
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install --no-cache-dir -r requirements.txt
 
       - name: Dashboard generieren & per E-Mail senden
         env:
