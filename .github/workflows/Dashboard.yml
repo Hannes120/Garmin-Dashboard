@@ -9,6 +9,14 @@ on:
     - cron: "30 3 * * 1-5"
   workflow_dispatch:   # manual trigger for testing
 
+# Don't let overlapping cron runs clobber each other's caches.
+concurrency:
+  group: training-dashboard
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
 jobs:
   dashboard:
     runs-on: ubuntu-latest
@@ -38,22 +46,23 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install garminconnect garth anthropic
+          pip install -r requirements.txt
 
       - name: Run dashboard
         env:
-          GARMIN_EMAIL:        ${{ secrets.GARMIN_EMAIL }}
-          GARMIN_PASSWORD:     ${{ secrets.GARMIN_PASSWORD }}
-          GARMIN_MFA:          ${{ secrets.GARMIN_MFA }}
-          GARM_TOKENS_DIR:     /tmp/garmin_tokens
-          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
-          ICLOUD_EMAIL:        ${{ secrets.ICLOUD_EMAIL }}
-          ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
-          DASHBOARD_TO:        ${{ secrets.DASHBOARD_TO }}
+          GARMIN_EMAIL:       ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD:    ${{ secrets.GARMIN_PASSWORD }}
+          GARM_TOKENS_DIR:    /tmp/garmin_tokens
+          CLAUDE_API_KEY:     ${{ secrets.CLAUDE_API_KEY }}
+          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:           ${{ secrets.GMAIL_TO }}
+          DASHBOARD_TZ:       Europe/Berlin
         run: python garmin_daily.py
 
       - name: Save sent-state cache
