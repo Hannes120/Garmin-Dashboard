@@ -14,7 +14,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
-    # Cache the "already sent today" flag across runs
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,6 +25,14 @@ jobs:
           key: dashboard-sent-${{ github.run_id }}
           restore-keys: |
             dashboard-sent-
+
+      - name: Restore Garmin token cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/garmin_tokens
+          key: garmin-tokens-${{ github.run_id }}
+          restore-keys: |
+            garmin-tokens-
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,7 +54,7 @@ jobs:
           ICLOUD_EMAIL:        ${{ secrets.ICLOUD_EMAIL }}
           ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
           DASHBOARD_TO:        ${{ secrets.DASHBOARD_TO }}
-        run: python dashboard.py
+        run: python garmin_daily.py
 
       - name: Save sent-state cache
         if: always()
@@ -55,3 +62,10 @@ jobs:
         with:
           path: /tmp/dashboard_sent_date.txt
           key: dashboard-sent-${{ github.run_id }}
+
+      - name: Save Garmin token cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/garmin_tokens
+          key: garmin-tokens-${{ github.run_id }}
