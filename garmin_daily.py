@@ -1,867 +1,764 @@
 #!/usr/bin/env python3
 """
-Garmin Daily Dashboard — Hannes Raschke
-Täglich automatisch ausgeführt von GitHub Actions.
-
-Ablauf:
-  1. Garmin-Login
-  2. Sleep-Polling — wartet bis Score verfügbar (bis zu 4h, deckt Aufstehen bis 9:00 ab)
-  3. Alle Daten laden
-  4. Kontext aufbauen (Tag, Events, Metriken)
-  5. Claude → Workout-Entscheidung (VO2max-fokussiert, polarisiertes Training)
-  6. Workout in Garmin Connect hochladen
-  7. Claude → HTML-Dashboard
-  8. E-Mail senden
+Garmin Training Dashboard
+Polls for today's sleep sync, then builds + emails a training dashboard.
 """
 
-import os, json, smtplib, datetime, traceback, time
+import os, json, time, logging, smtplib, datetime, statistics
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from garminconnect import Garmin
-import anthropic
+from anthropic import Anthropic
 
-GARMIN_EMAIL       = os.environ["GARMIN_EMAIL"]
-GARMIN_PASSWORD    = os.environ["GARMIN_PASSWORD"]
-CLAUDE_API_KEY     = os.environ["CLAUDE_API_KEY"]
-GMAIL_USER         = os.environ["GMAIL_USER"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-GMAIL_TO           = os.environ["GMAIL_TO"]
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-WEEKDAY_DE = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"]
+# ─── Constants ────────────────────────────────────────────────────────────────
 
-BAVARIAN_HOLIDAYS = {
-    datetime.date(2026, 1,  1): "Neujahr",
-    datetime.date(2026, 1,  6): "Heilige Drei Könige",
-    datetime.date(2026, 4,  3): "Karfreitag",
-    datetime.date(2026, 4,  6): "Ostermontag",
-    datetime.date(2026, 5,  1): "Tag der Arbeit",
-    datetime.date(2026, 5, 14): "Christi Himmelfahrt",
-    datetime.date(2026, 5, 25): "Pfingstmontag",
-    datetime.date(2026, 6,  4): "Fronleichnam",
-    datetime.date(2026, 8, 15): "Mariä Himmelfahrt",
-    datetime.date(2026, 10, 3): "Tag der Deutschen Einheit",
-    datetime.date(2026, 11, 1): "Allerheiligen",
-    datetime.date(2026, 12,25): "1. Weihnachtstag",
-    datetime.date(2026, 12,26): "2. Weihnachtstag",
-}
+RACE_CALENDAR = [
+    {"name": "Halbmarathon Geburtstag", "date": "2026-07-12", "type": "run",
+     "goal": "Sub 2:00 h"},
+    {"name": "Königsbrunn Middle Distance", "date": "2026-09-20", "type": "triathlon",
+     "goal": "Sub 6:00 h (1.9k/80k/20k)"},
+]
 
+POLARIZED_TARGET = 0.80   # 80% easy
+ANTHROPIC_MODEL  = "claude-sonnet-4-20250514"
 
-# ═══════════════════════════════════════════════════════════════════
-# 1. GARMIN CLIENT
-# ═══════════════════════════════════════════════════════════════════
-def get_garmin_client() -> Garmin:
-    client = Garmin(GARMIN_EMAIL, GARMIN_PASSWORD)
-    client.login()
-    print("   ✓ Garmin Login erfolgreich")
-    return client
+# ─── Garmin ───────────────────────────────────────────────────────────────────
 
+def garmin_connect():
+    import garminconnect
+    email    = os.environ["GARMIN_EMAIL"]
+    password = os.environ["GARMIN_PASSWORD"]
+    token_store = os.environ.get("GARM_TOKENS_DIR", "/tmp/garmin_tokens")
+    os.makedirs(token_store, exist_ok=True)
 
-# ═══════════════════════════════════════════════════════════════════
-# 2. SLEEP POLLING — wartet bis Score verfügbar (max 4h)
-# ═══════════════════════════════════════════════════════════════════
-def wait_for_sleep_score(client: Garmin,
-                          max_wait_min: int = 240,
-                          poll_interval_sec: int = 300) -> bool:
-    """
-    Prüft alle 5 Minuten ob Sleep Score für HEUTE da ist.
-    Max 4 Stunden Wartezeit — deckt Aufstehen bis 09:00 Uhr ab
-    (Skript startet 04:00 CEST + 4h = 08:00, mit Puffer bis ~09:00).
-    Gibt True zurück wenn Score gefunden, False nach Timeout.
-    """
-    today      = datetime.date.today()
-    start_time = datetime.datetime.now()
-    max_delta  = datetime.timedelta(minutes=max_wait_min)
-    attempt    = 0
-
-    print(f"   Sleep Polling für {today} | Max {max_wait_min}min | Check alle {poll_interval_sec//60}min")
-
-    while datetime.datetime.now() - start_time < max_delta:
-        attempt += 1
+    client = garminconnect.Garmin(email, password, is_cn=False,
+                                   prompt_mfa=lambda: os.environ.get("GARMIN_MFA",""))
+    for attempt in range(3):
         try:
-            raw = client.get_sleep_data(today.isoformat())
-            if raw and isinstance(raw, dict):
-                dto    = raw.get("dailySleepDTO") or raw
-                scores = dto.get("sleepScores", {}) if isinstance(dto, dict) else {}
-                score  = (scores.get("overallScore")
-                          or dto.get("overallSleepScore")
-                          or scores.get("overall", {}).get("value"))
-                if score and int(score) > 0:
-                    elapsed = (datetime.datetime.now() - start_time).seconds // 60
-                    print(f"   ✓ Sleep Score {score} — nach {elapsed}min (Versuch {attempt})")
-                    return True
+            client.login(token_store)
+            log.info("Garmin login OK")
+            return client
         except Exception as e:
-            print(f"   Poll {attempt} Fehler: {e}")
+            log.warning(f"Login attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))
+    raise RuntimeError("Garmin login failed after 3 attempts")
 
-        elapsed_min = (datetime.datetime.now() - start_time).seconds // 60
-        print(f"   Versuch {attempt}: kein Score — {elapsed_min}min gewartet")
-        time.sleep(poll_interval_sec)
 
-    print(f"   ⚠️ Timeout {max_wait_min}min — weiter ohne Sleep Score")
+def safe_get(fn, default=None):
+    for attempt in range(3):
+        try:
+            return fn()
+        except Exception as e:
+            log.warning(f"API call failed (attempt {attempt+1}): {e}")
+            time.sleep(5)
+    log.error("Returning default after 3 failures")
+    return default
+
+
+def fetch_all_data(client):
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+    two_weeks_ago = today - datetime.timedelta(days=14)
+
+    # ── Sleep (key: must exist to trigger dashboard) ──
+    sleep_raw = safe_get(
+        lambda: client.get_sleep_data(yesterday.isoformat()), {}
+    )
+    daily_sleep = (sleep_raw.get("dailySleepDTO") or
+                   sleep_raw.get("sleepDTO") or
+                   sleep_raw.get("daily_sleep") or {})
+
+    sleep_score     = daily_sleep.get("sleepScores", {}).get("overall", {}).get("value") or \
+                      daily_sleep.get("sleepScore") or \
+                      daily_sleep.get("overallScore")
+    sleep_duration  = daily_sleep.get("sleepTimeSeconds", 0) / 3600
+    rem_seconds     = daily_sleep.get("remSleepSeconds", 0)
+    deep_seconds    = daily_sleep.get("deepSleepSeconds", 0)
+    light_seconds   = daily_sleep.get("lightSleepSeconds", 0)
+
+    # ── Body Battery + HRV ──
+    body_battery = safe_get(
+        lambda: client.get_body_battery(today.isoformat()), []
+    )
+    bb_now = None
+    if body_battery:
+        charged = [e.get("charged") for e in body_battery if e.get("charged") is not None]
+        if charged:
+            bb_now = max(charged)
+
+    hrv_raw = safe_get(
+        lambda: client.get_hrv_data(today.isoformat()), {}
+    )
+    hrv_summary = hrv_raw.get("hrvSummary", {}) if isinstance(hrv_raw, dict) else {}
+    hrv_value   = hrv_summary.get("lastNight") or hrv_summary.get("weeklyAvg")
+
+    # ── Stats today ──
+    stats_raw = safe_get(
+        lambda: client.get_stats(today.isoformat()), {}
+    )
+    rhr         = stats_raw.get("restingHeartRate")
+    stress      = stats_raw.get("averageStressLevel")
+    steps       = stats_raw.get("totalSteps")
+    calories    = stats_raw.get("totalKilocalories")
+    vo2max      = stats_raw.get("maxMetValue") or stats_raw.get("vo2MaxValue")
+
+    # ── Activities last 14 days ──
+    activities_raw = safe_get(
+        lambda: client.get_activities_by_date(
+            two_weeks_ago.isoformat(), today.isoformat()
+        ), []
+    ) or []
+
+    activities = []
+    for a in activities_raw[:20]:
+        act_type = (a.get("activityType", {}).get("typeKey") or
+                    a.get("activityType") or "unknown").lower()
+        duration_min = (a.get("duration") or a.get("movingDuration") or 0) / 60
+        distance_km  = (a.get("distance") or 0) / 1000
+        tss          = a.get("trainingStressScore") or a.get("tss")
+        avg_hr       = a.get("averageHR") or a.get("averageHeartRate")
+        max_hr       = a.get("maxHR") or a.get("maxHeartRate")
+
+        hr_zones = {}
+        zones_raw = (a.get("heartRateZones") or
+                     a.get("hrZones") or
+                     a.get("zones") or [])
+        for z in zones_raw:
+            zone_num = z.get("zoneNumber") or z.get("zone")
+            secs     = z.get("secsInZone") or z.get("seconds") or z.get("duration") or 0
+            if zone_num:
+                hr_zones[f"z{zone_num}"] = round(secs / 60, 1)
+
+        act_date = (a.get("startTimeLocal") or a.get("beginTimestamp") or
+                    a.get("startTimeGMT") or "")[:10]
+
+        activities.append({
+            "date": act_date,
+            "type": act_type,
+            "duration_min": round(duration_min, 1),
+            "distance_km": round(distance_km, 2),
+            "tss": tss,
+            "avg_hr": avg_hr,
+            "max_hr": max_hr,
+            "hr_zones": hr_zones,
+            "name": a.get("activityName", ""),
+        })
+
+    # ── Zone analysis (last 7 days) ──
+    week_ago = today - datetime.timedelta(days=7)
+    recent_acts = [a for a in activities if a["date"] >= week_ago.isoformat()]
+
+    zone_totals = {"z1": 0, "z2": 0, "z3": 0, "z4": 0, "z5": 0}
+    total_training_min = 0
+    for a in recent_acts:
+        for z, mins in a["hr_zones"].items():
+            if z in zone_totals:
+                zone_totals[z] += mins
+        if not a["hr_zones"]:
+            total_training_min += a["duration_min"]
+
+    all_zone_mins = sum(zone_totals.values())
+    if all_zone_mins > 0:
+        zone_pct = {z: round(m / all_zone_mins * 100, 1)
+                    for z, m in zone_totals.items()}
+        easy_pct = zone_pct.get("z1", 0) + zone_pct.get("z2", 0)
+    else:
+        zone_pct = {}
+        easy_pct = None
+
+    # ── Training load (simple ATL/CTL from TSS) ──
+    tss_values = [a["tss"] for a in activities if a["tss"] is not None]
+    atl = round(statistics.mean(tss_values[-7:]),  1) if len(tss_values) >= 3 else None
+    ctl = round(statistics.mean(tss_values[-42:]), 1) if len(tss_values) >= 7 else None
+    tsb = round(ctl - atl, 1) if (atl and ctl) else None
+
+    return {
+        "date": today.isoformat(),
+        "sleep": {
+            "score": sleep_score,
+            "duration_h": round(sleep_duration, 2),
+            "rem_min": round(rem_seconds / 60),
+            "deep_min": round(deep_seconds / 60),
+            "light_min": round(light_seconds / 60),
+            "synced": sleep_score is not None or sleep_duration > 0,
+        },
+        "body": {
+            "battery": bb_now,
+            "hrv": hrv_value,
+            "rhr": rhr,
+            "stress": stress,
+            "steps": steps,
+            "calories": calories,
+            "vo2max": vo2max,
+        },
+        "load": {"atl": atl, "ctl": ctl, "tsb": tsb},
+        "zones_7d": {"totals_min": zone_totals, "pct": zone_pct, "easy_pct": easy_pct},
+        "activities_14d": activities,
+        "recent_count": len(recent_acts),
+    }
+
+
+# ─── Race Phase ───────────────────────────────────────────────────────────────
+
+def race_context():
+    today = datetime.date.today()
+    upcoming = []
+    for r in RACE_CALENDAR:
+        race_date = datetime.date.fromisoformat(r["date"])
+        days_out  = (race_date - today).days
+        if days_out >= -3:
+            upcoming.append({**r, "days_out": days_out})
+
+    if not upcoming:
+        return {"phase": "Off-season", "next_race": None, "days_out": None}
+
+    next_race = min(upcoming, key=lambda x: x["days_out"])
+    days_out  = next_race["days_out"]
+
+    if days_out <= 7:
+        phase = "Race Week"
+    elif days_out <= 21:
+        phase = "Taper"
+    elif days_out <= 56:
+        phase = "Build"
+    else:
+        phase = "Base"
+
+    return {"phase": phase, "next_race": next_race, "days_out": days_out,
+            "all_upcoming": upcoming}
+
+
+# ─── Claude Calls ─────────────────────────────────────────────────────────────
+
+def call_claude(client, system_prompt, user_prompt, max_tokens=1200):
+    for attempt in range(2):
+        try:
+            resp = client.messages.create(
+                model=ANTHROPIC_MODEL,
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            return resp.content[0].text
+        except Exception as e:
+            log.warning(f"Claude call attempt {attempt+1} failed: {e}")
+            time.sleep(5)
+    return None
+
+
+def build_todays_workout(claude_client, data, race_ctx):
+    system = """Du bist ein erfahrener Triathlon-Coach.
+Antworte NUR mit einem JSON-Objekt — kein Prosa, keine Markdown-Backticks.
+Schema:
+{
+  "primary": {
+    "sport": "swim|bike|run|strength|rest",
+    "title": "kurzer Titel",
+    "duration_min": <int>,
+    "intensity": "easy|moderate|hard",
+    "zones": "<z.B. Z1-Z2>",
+    "structure": "<Warm-up / Hauptteil / Cool-down in 2-3 Sätzen>",
+    "rationale": "<1 Satz Begründung>"
+  },
+  "optional": {
+    "sport": "...",
+    "title": "...",
+    "duration_min": <int>,
+    "intensity": "...",
+    "zones": "...",
+    "structure": "...",
+    "rationale": "..."
+  } | null,
+  "day_verdict": "<easy|moderate|hard — basierend auf Erholung>",
+  "recovery_note": "<1 Satz falls Schlaf/BB schlecht>"
+}"""
+
+    user = f"""Athletendaten heute ({data['date']}):
+
+Schlaf: Score={data['sleep']['score']}, Dauer={data['sleep']['duration_h']}h, Tief={data['sleep']['deep_min']}min, REM={data['sleep']['rem_min']}min
+Body Battery: {data['body']['battery']}/100
+HRV: {data['body']['hrv']} ms
+Ruhepuls: {data['body']['rhr']} bpm
+Stress gestern: {data['body']['stress']}
+
+Trainingsload: ATL={data['load']['atl']}, CTL={data['load']['ctl']}, TSB={data['load']['tsb']}
+Zonenverteilung letzte 7 Tage: {json.dumps(data['zones_7d']['pct'])}
+Easyanteil: {data['zones_7d']['easy_pct']}% (Ziel: ≥80%)
+
+Letzte 5 Aktivitäten:
+{json.dumps(data['activities_14d'][:5], indent=2)}
+
+Race-Phase: {race_ctx['phase']}
+Nächstes Rennen: {race_ctx['next_race']['name'] if race_ctx['next_race'] else 'keins'} in {race_ctx['days_out']} Tagen
+Ziel: {race_ctx['next_race']['goal'] if race_ctx['next_race'] else '-'}
+
+Wochentag: {datetime.date.today().strftime('%A')}
+
+Regeln:
+- Polarisiertes Training: 80% Z1-Z2, max 20% Z3-Z5
+- Wenn TSB < -20 oder BB < 40 oder Schlaf < 6h → nur Easy oder Rest
+- Bei Race Week nur Aktivierungseinheiten, kein Stress
+- Wenn Easy-Anteil < 70%: primary muss Z1-Z2 sein egal was
+- Chainrings 52-36T, Shimano Dura-Ace Di2"""
+
+    raw = call_claude(claude_client, system, user, max_tokens=1000)
+    if not raw:
+        return None
+    try:
+        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Workout JSON parse error: {e}\nRaw: {raw[:300]}")
+        return None
+
+
+def build_week_plan(claude_client, data, race_ctx):
+    system = """Du bist ein erfahrener Triathlon-Coach.
+Antworte NUR mit einem JSON-Objekt — kein Prosa, keine Markdown-Backticks.
+Schema:
+{
+  "week_theme": "<1 Satz Wochenmotto>",
+  "days": {
+    "Mo": {"sport": "...", "focus": "...", "duration_min": <int>, "intensity": "easy|moderate|hard"},
+    "Di": {...},
+    "Mi": {...},
+    "Do": {...},
+    "Fr": {...},
+    "Sa": {...},
+    "So": {...}
+  },
+  "weekly_load_note": "<1 Satz zu Gesamtvolumen und Polarisierung>",
+  "key_session": "<welcher Tag ist die wichtigste Einheit>"
+}"""
+
+    today_weekday = datetime.date.today().strftime("%A")
+    user = f"""Erstelle einen Wochenplan (Heute ist {today_weekday}, {data['date']}).
+
+Phase: {race_ctx['phase']}
+Nächstes Rennen: {race_ctx['next_race']['name'] if race_ctx['next_race'] else 'keins'} in {race_ctx['days_out']} Tagen (Ziel: {race_ctx['next_race']['goal'] if race_ctx['next_race'] else '-'})
+
+Trainingsload: ATL={data['load']['atl']}, CTL={data['load']['ctl']}, TSB={data['load']['tsb']}
+Zonenverteilung letzte 7 Tage: {json.dumps(data['zones_7d']['pct'])}
+Aktivitäten letzte 14 Tage (Überblick): {json.dumps([{'date':a['date'],'type':a['type'],'duration_min':a['duration_min'],'intensity_approx':'hard' if a['avg_hr'] and a['avg_hr']>160 else 'easy'} for a in data['activities_14d']], indent=2)}
+
+Regeln:
+- Triathlet: Schwimmen + Radfahren + Laufen
+- 80/20 Polarisierung einhalten
+- Max 2 harte Einheiten pro Woche
+- 1 Ruhetag (meist Freitag oder Montag)
+- Lange Einheit am Wochenende (Bike oder Lauf)
+- Bei TSB < -15: Volumen reduzieren
+- Taper-Phase: Frequenz halten, Volumen -30-40%"""
+
+    raw = call_claude(claude_client, system, user, max_tokens=1200)
+    if not raw:
+        return None
+    try:
+        clean = raw.strip().lstrip("```json").lstrip("```").rstrip("```").strip()
+        return json.loads(clean)
+    except Exception as e:
+        log.error(f"Week plan JSON parse error: {e}\nRaw: {raw[:300]}")
+        return None
+
+
+# ─── HTML Dashboard ───────────────────────────────────────────────────────────
+
+def render_metric(label, value, unit="", warn_below=None, good_above=None):
+    if value is None:
+        display = "–"
+        color = "#888"
+    else:
+        display = str(value)
+        if warn_below and isinstance(value, (int, float)) and value < warn_below:
+            color = "#e05c4a"
+        elif good_above and isinstance(value, (int, float)) and value >= good_above:
+            color = "#3aaa6e"
+        else:
+            color = "#1a1a2e"
+    return f"""
+    <td style="padding:8px 12px;text-align:center;vertical-align:top;">
+      <div style="font-size:22px;font-weight:700;color:{color};line-height:1.1;">{display}<span style="font-size:11px;font-weight:400;color:#888;margin-left:2px;">{unit}</span></div>
+      <div style="font-size:10px;color:#999;text-transform:uppercase;letter-spacing:.5px;margin-top:2px;">{label}</div>
+    </td>"""
+
+
+def zone_bar(label, pct, color):
+    if not pct:
+        return ""
+    bar_w = min(int(pct * 1.8), 180)
+    return f"""
+    <tr>
+      <td style="font-size:12px;color:#555;padding:3px 0;width:30px;">{label}</td>
+      <td style="padding:3px 6px;">
+        <div style="background:{color};width:{bar_w}px;height:12px;border-radius:3px;display:inline-block;"></div>
+      </td>
+      <td style="font-size:12px;color:#333;padding:3px 0;">{pct}%</td>
+    </tr>"""
+
+
+def workout_card(w, is_optional=False):
+    if not w:
+        return ""
+    intensity_colors = {"easy": "#3aaa6e", "moderate": "#f5a623", "hard": "#e05c4a"}
+    sport_icons = {"swim": "🏊", "bike": "🚴", "run": "🏃", "strength": "💪", "rest": "😴"}
+    tag = "Optional" if is_optional else "Heute"
+    color = intensity_colors.get(w.get("intensity", ""), "#888")
+    icon  = sport_icons.get(w.get("sport", ""), "🎯")
+    return f"""
+    <div style="background:#f9f9fb;border-left:4px solid {color};border-radius:8px;padding:16px 18px;margin:12px 0;">
+      <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;">{tag}</div>
+      <div style="font-size:17px;font-weight:700;color:#1a1a2e;margin:4px 0 8px;">
+        {icon} {w.get('title','Einheit')}
+      </div>
+      <table cellpadding="0" cellspacing="0" style="margin-bottom:10px;">
+        <tr>
+          <td style="padding-right:16px;font-size:12px;color:#555;">⏱ {w.get('duration_min','?')} min</td>
+          <td style="padding-right:16px;font-size:12px;color:#555;">📊 {w.get('zones','–')}</td>
+          <td style="font-size:12px;color:{color};font-weight:600;">{w.get('intensity','').capitalize()}</td>
+        </tr>
+      </table>
+      <div style="font-size:13px;color:#333;line-height:1.6;margin-bottom:8px;">{w.get('structure','')}</div>
+      <div style="font-size:11px;color:#888;font-style:italic;">{w.get('rationale','')}</div>
+    </div>"""
+
+
+def week_plan_table(plan):
+    if not plan or "days" not in plan:
+        return ""
+    intensity_bg = {"easy": "#e8f7ef", "moderate": "#fff4e0", "hard": "#fdecea"}
+    intensity_col = {"easy": "#2e8b57", "moderate": "#cc8800", "hard": "#c0392b"}
+    sport_icons = {"swim": "🏊", "bike": "🚴", "run": "🏃", "strength": "💪", "rest": "😴",
+                   "swim/run": "🏊🏃", "bike/run": "🚴🏃"}
+
+    rows = ""
+    today_short = datetime.date.today().strftime("%a")[:2]
+    day_map = {"Mo": "Mon", "Di": "Tue", "Mi": "Wed", "Do": "Thu",
+               "Fr": "Fri", "Sa": "Sat", "So": "Sun"}
+
+    for day_de, info in plan["days"].items():
+        is_today = day_map.get(day_de, "")[:2].lower() == today_short.lower()
+        bg = "#eef3ff" if is_today else "transparent"
+        fw = "700" if is_today else "400"
+        intensity = info.get("intensity", "easy")
+        pill_bg  = intensity_bg.get(intensity, "#eee")
+        pill_col = intensity_col.get(intensity, "#333")
+        sport = info.get("sport", "")
+        icon  = sport_icons.get(sport.lower(), "🎯")
+        rows += f"""
+        <tr style="background:{bg};">
+          <td style="padding:8px 10px;font-size:13px;font-weight:{fw};color:#1a1a2e;width:32px;">{day_de}</td>
+          <td style="padding:8px 4px;font-size:16px;">{icon}</td>
+          <td style="padding:8px 10px;font-size:13px;color:#333;">{info.get('focus','')}</td>
+          <td style="padding:8px 6px;font-size:11px;text-align:center;">
+            <span style="background:{pill_bg};color:{pill_col};border-radius:10px;padding:2px 8px;font-weight:600;">{info.get('duration_min','?')}min</span>
+          </td>
+          <td style="padding:8px 6px;font-size:11px;color:{pill_col};">{intensity.capitalize()}</td>
+        </tr>"""
+
+    return f"""
+    <div style="overflow:hidden;border-radius:8px;border:1px solid #ebebeb;">
+      <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+        {rows}
+      </table>
+    </div>
+    <div style="margin-top:8px;font-size:11px;color:#888;font-style:italic;">{plan.get('weekly_load_note','')}</div>
+    """
+
+
+def build_html(data, workout, week_plan, race_ctx):
+    today = datetime.date.today()
+    weekday_de = ["Montag","Dienstag","Mittwoch","Donnerstag","Freitag","Samstag","Sonntag"][today.weekday()]
+    date_str = today.strftime(f"{weekday_de}, %d. %B %Y")
+
+    sleep  = data["sleep"]
+    body   = data["body"]
+    load   = data["load"]
+    zones  = data["zones_7d"]
+
+    # Sleep quality label
+    sc = sleep.get("score")
+    if   sc and sc >= 80: sq_label, sq_color = "Erholt", "#3aaa6e"
+    elif sc and sc >= 60: sq_label, sq_color = "Ok",     "#f5a623"
+    elif sc:              sq_label, sq_color = "Schlecht","#e05c4a"
+    else:                 sq_label, sq_color = "–",       "#888"
+
+    # Phase badge
+    phase_colors = {
+        "Base": "#3aaa6e", "Build": "#f5a623",
+        "Peak": "#e05c4a", "Taper": "#9b59b6",
+        "Race Week": "#c0392b", "Off-season": "#888"
+    }
+    phase_color = phase_colors.get(race_ctx["phase"], "#888")
+
+    # Zone bars
+    zp   = zones.get("pct", {})
+    zbars = (
+        zone_bar("Z1", zp.get("z1"), "#3aaa6e") +
+        zone_bar("Z2", zp.get("z2"), "#5bc8af") +
+        zone_bar("Z3", zp.get("z3"), "#f5a623") +
+        zone_bar("Z4", zp.get("z4"), "#e07b3a") +
+        zone_bar("Z5", zp.get("z5"), "#e05c4a")
+    )
+    easy_pct = zones.get("easy_pct")
+    if easy_pct is not None:
+        polarized_status = (
+            f'<span style="color:#3aaa6e;font-weight:700;">✓ {easy_pct}% Easy</span>'
+            if easy_pct >= 78 else
+            f'<span style="color:#e05c4a;font-weight:700;">⚠ Nur {easy_pct}% Easy — mehr Z1/Z2!</span>'
+        )
+    else:
+        polarized_status = '<span style="color:#888;">Keine Zonendaten</span>'
+
+    # Workout HTML
+    primary_html  = workout_card(workout.get("primary"))  if workout else ""
+    optional_html = workout_card(workout.get("optional"), True) if workout and workout.get("optional") else ""
+    recovery_note = (f'<div style="background:#fff8e1;border-radius:6px;padding:10px 14px;'
+                     f'font-size:12px;color:#8a6000;margin-top:8px;">'
+                     f'⚡ {workout["recovery_note"]}</div>'
+                     if workout and workout.get("recovery_note") else "")
+
+    # Week plan HTML
+    week_html = week_plan_table(week_plan) if week_plan else (
+        '<div style="color:#aaa;font-size:13px;">Kein Wochenplan verfügbar</div>'
+    )
+
+    # Race countdown
+    race_rows = ""
+    for r in (race_ctx.get("all_upcoming") or []):
+        days = r["days_out"]
+        bar_w = min(int((1 - days/120) * 120), 120) if days > 0 else 120
+        race_rows += f"""
+        <tr>
+          <td style="padding:6px 0;font-size:13px;font-weight:600;color:#1a1a2e;">{r['name']}</td>
+          <td style="padding:6px 10px;">
+            <div style="background:#e8e8f0;border-radius:4px;width:120px;height:8px;overflow:hidden;">
+              <div style="background:{phase_color};width:{bar_w}px;height:8px;border-radius:4px;"></div>
+            </div>
+          </td>
+          <td style="padding:6px 0;font-size:12px;color:#888;">{days}d · {r.get('goal','')}</td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Training {today.isoformat()}</title>
+</head>
+<body style="margin:0;padding:0;background:#f0f0f5;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+<div style="max-width:580px;margin:20px auto;background:#fff;border-radius:16px;overflow:hidden;box-shadow:0 2px 20px rgba(0,0,0,.08);">
+
+  <!-- Header -->
+  <div style="background:#1a1a2e;padding:22px 24px 18px;">
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;">
+      <div>
+        <div style="font-size:11px;color:#8888aa;text-transform:uppercase;letter-spacing:1px;">Training Dashboard</div>
+        <div style="font-size:20px;font-weight:700;color:#fff;margin-top:2px;">{date_str}</div>
+      </div>
+      <div style="text-align:right;">
+        <div style="display:inline-block;background:{phase_color};color:#fff;font-size:11px;font-weight:700;
+                    padding:4px 10px;border-radius:20px;letter-spacing:.5px;">{race_ctx['phase'].upper()}</div>
+        <div style="font-size:11px;color:{sq_color};margin-top:6px;font-weight:600;">Schlaf: {sq_label}</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Body Metrics -->
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;">Status</div>
+    <table width="100%" cellpadding="0" cellspacing="0">
+      <tr>
+        {render_metric("Body Battery", body.get('battery'), "/100", warn_below=40, good_above=70)}
+        {render_metric("HRV", body.get('hrv'), "ms", warn_below=40, good_above=70)}
+        {render_metric("Ruhepuls", body.get('rhr'), "bpm", warn_below=None)}
+        {render_metric("Schlaf", sleep.get('duration_h'), "h", warn_below=6.5, good_above=7.5)}
+      </tr>
+      <tr>
+        {render_metric("Schlaf Score", sleep.get('score'), "/100", warn_below=60, good_above=80)}
+        {render_metric("ATL", load.get('atl'), "TSS")}
+        {render_metric("CTL", load.get('ctl'), "TSS")}
+        {render_metric("TSB", load.get('tsb'), "", warn_below=-25)}
+      </tr>
+    </table>
+  </div>
+
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+
+  <!-- Today's Workout -->
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:4px;">Einheit heute</div>
+    {recovery_note}
+    {primary_html}
+    {optional_html}
+  </div>
+
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+
+  <!-- Week Plan -->
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;">
+      Wochenplan · {week_plan.get('week_theme','') if week_plan else ''}
+    </div>
+    {week_html}
+  </div>
+
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+
+  <!-- Zone Balance -->
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;">Zonenverteilung (7 Tage)</div>
+    <table cellpadding="0" cellspacing="0">{zbars}</table>
+    <div style="margin-top:8px;font-size:12px;">{polarized_status}</div>
+  </div>
+
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+
+  <!-- Race Countdown -->
+  <div style="padding:16px 20px 20px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px;">Wettkämpfe</div>
+    <table width="100%" cellpadding="0" cellspacing="0">{race_rows}</table>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+
+# ─── Email ────────────────────────────────────────────────────────────────────
+
+def send_email(html, subject):
+    smtp_user   = os.environ["ICLOUD_EMAIL"]
+    smtp_pass   = os.environ["ICLOUD_APP_PASSWORD"]
+    to_addr     = os.environ.get("DASHBOARD_TO", smtp_user)
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = smtp_user
+    msg["To"]      = to_addr
+    msg.attach(MIMEText(html, "html", "utf-8"))
+
+    for attempt in range(3):
+        try:
+            with smtplib.SMTP_SSL("smtp.mail.me.com", 587) as s:
+                s.login(smtp_user, smtp_pass)
+                s.sendmail(smtp_user, to_addr, msg.as_string())
+            log.info(f"Email sent to {to_addr}")
+            return True
+        except Exception as e:
+            log.warning(f"Email attempt {attempt+1} failed: {e}")
+            time.sleep(5)
     return False
 
 
-# ═══════════════════════════════════════════════════════════════════
-# 3. DATEN LADEN
-# ═══════════════════════════════════════════════════════════════════
-def get_garmin_data(client: Garmin) -> dict:
-    today    = datetime.date.today()
-    dates_14 = [(today - datetime.timedelta(days=i)).isoformat() for i in range(14)]
-    dates_7  = dates_14[:7]
-    data = {"pulled_at": datetime.datetime.now().isoformat(), "today": today.isoformat()}
+# ─── Garmin Workout Upload ─────────────────────────────────────────────────────
+
+def upload_workout_to_garmin(workout_data, garmin_client):
+    if not workout_data or not workout_data.get("primary"):
+        return
+    primary = workout_data["primary"]
+    sport_map = {"run": "running", "bike": "cycling", "swim": "swimming",
+                 "strength": "strength_training", "rest": None}
+    sport = sport_map.get(primary.get("sport"), "other")
+    if not sport:
+        return
+
+    duration_sec = (primary.get("duration_min") or 0) * 60
+    if duration_sec < 60:
+        return
 
     try:
-        data["activities"] = client.get_activities(0, 60)
-        print(f"   Aktivitäten: {len(data['activities'])}")
+        import garth
+        payload = {
+            "workoutName": primary.get("title", "Training"),
+            "sport": sport,
+            "estimatedDurationInSecs": duration_sec,
+            "workoutSegments": [{
+                "segmentOrder": 1,
+                "sportType": {"sportTypeKey": sport},
+                "workoutSteps": [{
+                    "type": "ExecutableStepDTO",
+                    "stepOrder": 1,
+                    "stepType": {"stepTypeKey": "interval"},
+                    "durationType": {"durationTypeKey": "time"},
+                    "durationValue": duration_sec,
+                    "targetType": {"workoutTargetTypeKey": "no.target"},
+                }]
+            }]
+        }
+        garth.connectapi("/workout-service/workout", method="POST", json=payload)
+        log.info("Workout uploaded to Garmin Connect")
     except Exception as e:
-        print(f"   Aktivitäten Fehler: {e}"); data["activities"] = []
+        log.warning(f"Garmin workout upload failed (non-critical): {e}")
 
-    sleep_list = []
-    for date in dates_14:
-        try:
-            s = client.get_sleep_data(date)
-            if s and isinstance(s, dict):
-                dto = s.get("dailySleepDTO") or s
-                if isinstance(dto, dict) and dto.get("calendarDate"):
-                    sleep_list.append(dto)
-        except: pass
-    data["sleep"] = sleep_list
-    print(f"   Schlaf: {len(sleep_list)} Nächte")
 
-    hrv_list = []
-    for date in dates_7:
-        try:
-            h = client.get_hrv_data(date)
-            if h: hrv_list.append({"date": date, "data": h})
-        except: pass
-    data["hrv"] = hrv_list
+# ─── State: Already Sent Today ─────────────────────────────────────────────────
 
-    readiness_list = []
-    for date in dates_7:
-        try:
-            r = client.get_training_readiness(date)
-            if r: readiness_list.append({"date": date, "data": r})
-        except: pass
-    data["readiness"] = readiness_list
+STATE_FILE = "/tmp/dashboard_sent_date.txt"
 
-    try: data["training_load"] = client.get_training_load()
-    except: data["training_load"] = {}
+def already_sent_today():
+    try:
+        with open(STATE_FILE) as f:
+            return f.read().strip() == datetime.date.today().isoformat()
+    except FileNotFoundError:
+        return False
 
-    try: data["today_stats"] = client.get_stats(today.isoformat())
-    except: data["today_stats"] = {}
+def mark_sent():
+    with open(STATE_FILE, "w") as f:
+        f.write(datetime.date.today().isoformat())
 
-    try: data["body_battery"] = client.get_body_battery(dates_7[-1], dates_7[0])
-    except: data["body_battery"] = []
 
-    try: data["profile"] = client.get_user_profile()
-    except: data["profile"] = {}
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
-    data["last_sessions"] = get_last_sessions(client, today)
-    return data
-
-
-def get_last_sessions(client: Garmin, today: datetime.date, days_back: int = 120) -> dict:
-    """Findet letzte Session pro Disziplin — zieht 100 Aktivitäten, filtert lokal."""
-    def parse_date(act):
-        ts = act.get("startTimeLocal") or act.get("startTimeGMT")
-        if ts is None: return None
-        if isinstance(ts, str):
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%S.%f"):
-                try: return datetime.datetime.strptime(ts[:26], fmt).date()
-                except: continue
-            try: return datetime.datetime.fromisoformat(ts[:19]).date()
-            except: return None
-        if isinstance(ts, (int, float)):
-            try: return datetime.datetime.fromtimestamp(ts/1000).date()
-            except: return None
-        return None
-
-    def type_of(act):
-        t = act.get("activityType", "")
-        if isinstance(t, dict): return str(t.get("typeKey") or t.get("typeId") or "").lower()
-        return str(t).lower()
-
-    activities = []
-    try: activities = client.get_activities(0, 100)
-    except Exception as e: print(f"   get_activities Fehler: {e}")
-
-    def find_last(matcher):
-        candidates = [(parse_date(a), a) for a in activities if matcher(type_of(a))]
-        candidates = [(d, a) for d, a in candidates if d]
-        if not candidates: return None
-        latest_date, latest = max(candidates, key=lambda x: x[0])
-        return {
-            "date": latest_date.isoformat(),
-            "days_ago": (today - latest_date).days,
-            "name": latest.get("activityName") or latest.get("name", ""),
-            "distance_m": int(latest.get("distance", 0) or 0),
-            "duration_min": round((latest.get("duration", 0) or 0) / 60, 0),
-            "avg_hr": latest.get("averageHR") or latest.get("avgHr"),
-        }
-
-    sessions = {
-        "last_swim": find_last(lambda t: "swim" in t),
-        "last_run":  find_last(lambda t: t in ("running","treadmill_running","trail_running","track_running","virtual_run")),
-        "last_bike": find_last(lambda t: "cycling" in t or "biking" in t),
-    }
-    for sport, info in sessions.items():
-        if info: print(f"   {sport}: {info['days_ago']}d her ({info['distance_m']}m, {info['date']})")
-        else: print(f"   {sport}: keine Session in {len(activities)} Aktivitäten")
-    return sessions
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 4. METRIKEN EXTRAHIEREN
-# ═══════════════════════════════════════════════════════════════════
-def extract_fresh_metrics(garmin_data: dict) -> dict:
-    today     = datetime.date.today()
-    yesterday = today - datetime.timedelta(days=1)
-    result    = {}
-
-    def freshness(d):
-        if not d: return "unbekannt"
-        if d == today.isoformat():     return "HEUTE"
-        if d == yesterday.isoformat(): return "GESTERN"
-        return d
-
-    # Schlaf — FIX: or 0 statt ,0 (fängt None-Werte ab)
-    sleep_entries = garmin_data.get("sleep", [])
-    if sleep_entries:
-        latest = max(sleep_entries, key=lambda x: x.get("calendarDate",""), default=None)
-        if latest:
-            scores  = latest.get("sleepScores", {})
-            overall = (scores.get("overallScore") or latest.get("overallSleepScore")
-                       or scores.get("overall",{}).get("value"))
-            dur_s   = ((latest.get("deepSleepSeconds") or 0)
-                       + (latest.get("lightSleepSeconds") or 0)
-                       + (latest.get("remSleepSeconds") or 0))
-            spo2    = latest.get("spo2SleepSummary", {})
-            date_v  = latest.get("calendarDate","")
-            entry   = {"freshness": freshness(date_v), "date": date_v}
-            if overall:                     entry["score"]      = overall
-            if dur_s > 0:                   entry["duration_h"] = round(dur_s/3600, 1)
-            rem_s = latest.get("remSleepSeconds")
-            if rem_s:  entry["rem_h"]  = round((rem_s  or 0)/3600, 1)
-            deep_s = latest.get("deepSleepSeconds")
-            if deep_s: entry["deep_h"] = round((deep_s or 0)/3600, 1)
-            if spo2.get("averageSPO2"): entry["spo2_avg"] = spo2["averageSPO2"]
-            if spo2.get("lowestSPO2"):  entry["spo2_low"] = spo2["lowestSPO2"]
-            result["sleep"] = entry
-
-    # HRV
-    hrv_entries = garmin_data.get("hrv", [])
-    if hrv_entries:
-        latest = max(hrv_entries, key=lambda x: x.get("date",""), default=None)
-        if latest:
-            raw   = latest.get("data", {})
-            entry = {"freshness": freshness(latest["date"]), "date": latest["date"]}
-            weekly, last = None, None
-            if isinstance(raw, dict):
-                weekly = raw.get("weeklyAvg") or raw.get("hrvWeeklyAverage")
-                last   = raw.get("lastNight") or raw.get("lastNight5MinHigh")
-                if not (weekly or last):
-                    s = raw.get("hrvSummary", {})
-                    weekly = s.get("weeklyAvg") or s.get("weekly5MinHigh")
-                    last   = s.get("lastNight") or s.get("lastNight5MinHigh")
-            elif isinstance(raw, list):
-                for item in raw:
-                    if isinstance(item, dict):
-                        weekly = item.get("weeklyAvg") or item.get("hrvWeeklyAverage")
-                        last   = item.get("lastNight") or item.get("lastNight5MinHigh")
-                        if weekly or last: break
-            if weekly: entry["weekly_avg_ms"] = weekly
-            if last:   entry["last_night_ms"] = last
-            result["hrv"] = entry
-
-    # Training Readiness
-    readiness_entries = garmin_data.get("readiness", [])
-    if readiness_entries:
-        latest = max(readiness_entries, key=lambda x: x.get("date",""), default=None)
-        if latest:
-            raw   = latest.get("data", {})
-            entry = {"freshness": freshness(latest["date"]), "date": latest["date"]}
-            def find_r(obj):
-                if isinstance(obj, dict):
-                    return (obj.get("score") or obj.get("trainingReadinessScore"),
-                            obj.get("level") or obj.get("trainingReadinessLevel"))
-                if isinstance(obj, list):
-                    for item in obj:
-                        s, l = find_r(item)
-                        if s: return s, l
-                return None, None
-            score, level = find_r(raw)
-            if score: entry["score"] = score
-            if level: entry["level"] = level
-            result["readiness"] = entry
-
-    # Today Stats
-    ts = garmin_data.get("today_stats", {})
-    if ts:
-        te = {"freshness": "HEUTE"}
-        if ts.get("restingHeartRate"):        te["rhr"]        = ts["restingHeartRate"]
-        if ts.get("averageStressLevel"):      te["stress_avg"] = ts["averageStressLevel"]
-        if ts.get("totalSteps"):              te["steps"]      = ts["totalSteps"]
-        if ts.get("bodyBatteryChargedValue"): te["bb_charged"] = ts["bodyBatteryChargedValue"]
-        if ts.get("bodyBatteryDrainedValue"): te["bb_drained"] = ts["bodyBatteryDrainedValue"]
-        result["today_stats"] = te
-
-    # Body Battery
-    bb_data = garmin_data.get("body_battery", [])
-    if isinstance(bb_data, list) and bb_data:
-        try:
-            last_bb = bb_data[-1]
-            if isinstance(last_bb, dict):
-                val = last_bb.get("bodyBatteryLevel") or last_bb.get("charged") or last_bb.get("value")
-                if val: result["body_battery_now"] = val
-        except: pass
-
-    # Training Load
-    tl = garmin_data.get("training_load", {})
-    if tl and isinstance(tl, dict):
-        le = {}
-        if tl.get("acuteLoad"):                le["atl"]  = tl["acuteLoad"]
-        if tl.get("chronicLoad"):               le["ctl"]  = tl["chronicLoad"]
-        if tl.get("acuteChronicWorkloadRatio"): le["acwr"] = round(tl["acuteChronicWorkloadRatio"],2)
-        if le: result["training_load"] = le
-
-    # Letzte Sessions
-    last_sessions = garmin_data.get("last_sessions", {})
-    if last_sessions.get("last_swim"): result["last_swim"] = last_sessions["last_swim"]
-    if last_sessions.get("last_run"):  result["last_run"]  = last_sessions["last_run"]
-    if last_sessions.get("last_bike"): result["last_bike"] = last_sessions["last_bike"]
-
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 5. TAGESKONTEXT
-# ═══════════════════════════════════════════════════════════════════
-def get_day_context(today_date: datetime.date) -> dict:
-    work_active = today_date <= datetime.date(2026, 7, 17)
-    weekday     = today_date.weekday()
-    is_hol      = today_date in BAVARIAN_HOLIDAYS
-    is_wkend    = weekday >= 5
-    is_fri      = weekday == 4
-    hol_name    = BAVARIAN_HOLIDAYS.get(today_date, "")
-
-    upcoming_free = []
-    for i in range(1, 11):
-        d = today_date + datetime.timedelta(days=i)
-        if d.weekday() >= 5 or d in BAVARIAN_HOLIDAYS:
-            upcoming_free.append({
-                "date": d.isoformat(), "weekday": WEEKDAY_DE[d.weekday()],
-                "name": BAVARIAN_HOLIDAYS.get(d, "Wochenende"), "days_from_now": i
-            })
-
-    if is_wkend or is_hol:
-        return {"type": "FREIER_TAG", "label": hol_name or WEEKDAY_DE[weekday],
-                "training_window": "Ganztags", "double_session": True,
-                "note": "Wochenende/Feiertag — ganztags Zeit, lange Sessions möglich",
-                "upcoming_free_days": upcoming_free}
-    elif is_fri and work_active:
-        return {"type": "FREITAG", "label": "Freitag",
-                "training_window": "Ab 16:30", "double_session": False,
-                "note": "Freitag — langer Abend möglich",
-                "upcoming_free_days": upcoming_free}
-    elif work_active:
-        return {"type": "ARBEITSTAG", "label": WEEKDAY_DE[weekday],
-                "training_window": "Ab 16:30", "double_session": False,
-                "note": "Arbeitstag — ab 16:30 trainingsfähig",
-                "upcoming_free_days": upcoming_free}
-    else:
-        return {"type": "FREI", "label": WEEKDAY_DE[weekday],
-                "training_window": "Ganztags", "double_session": True,
-                "note": "Voller Trainingstag", "upcoming_free_days": upcoming_free}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 6. EVENTS
-# ═══════════════════════════════════════════════════════════════════
-def get_events_context(today_date: datetime.date) -> list:
-    events_config = [
-        {"name": "IfA Nonstop Triathlon Bamberg", "emoji": "🏊🚴🏃",
-         "date": datetime.date(2026, 6, 7), "location": "Ebinger See, Rattelsdorf",
-         "type": "sprint_triathlon", "distance": "750m / 21km / 5km",
-         "goal": "Finishen + Spaß. Zielzeit ~1:32.",
-         # Amateur-Taper: nur 5-7 Tage, max 25% Volumenreduktion — kein Ultra-Taper
-         "taper_days": 5,
-         "taper_style": "AMATEUR-TAPER: 5 Tage, Volumen -20%, Intensität halten, keine komplette Pause",
-         "disciplines": ["swim","bike","run"],
-         "critical_notes": [
-             "Schwimmen: >7 Tage keine Session → Warnung",
-             "Mind. 2 Brick-Einheiten absolviert haben",
-             "Polar H9 unter Neopren für T1-Start"
-         ]},
-        {"name": "Halbmarathon Geburtstag 🎂", "emoji": "🏃",
-         "date": datetime.date(2026, 7, 12), "location": "München (TBD)",
-         "type": "halfmarathon", "distance": "21.1km",
-         "goal": "ADAPTIV: Basis sub 2:00h (5:41/km). Wenn Fitness zeigt schnelleres Tempo möglich → Ziel anpassen.",
-         "taper_days": 7,
-         "taper_style": "AMATEUR-TAPER: 7 Tage, Volumen -25%, 2 kurze schnelle Einheiten als Sharpener",
-         "disciplines": ["run"],
-         "critical_notes": ["5 Wochen Laufaufbau nach Bamberg", "Ziel dynamisch nach unten anpassen"]},
-        {"name": "1. triathlon.de CUP Königsbrunn", "emoji": "🏊🚴🏃",
-         "date": datetime.date(2026, 9, 20), "location": "Ilsesee, Königsbrunn",
-         "type": "middle_distance",
-         "distance": "1.9km / 80km / 20km",
-         "goal": "Finishen. Mitteldistanz als erste große Herausforderung. Ziel: unter 6h.",
-         "taper_days": 10,
-         "taper_style": "AMATEUR-TAPER: 10 Tage, Volumen -30%, 2 Sharpener-Einheiten",
-         "disciplines": ["swim","bike","run"],
-         "critical_notes": [
-             "Schwimmaufbau ab Juli kritisch für 1.9km",
-             "Long Rides >3h nötig ab Juli",
-             "Brick-Sessions bis 3h+ ab August"
-         ]},
-        # Weitere Events:
-        # {"name":"...", "emoji":"🏁", "date": datetime.date(2026,10,1), ...}
-    ]
-    result = []
-    for ev in events_config:
-        days_left = (ev["date"] - today_date).days
-        if days_left < -2: continue
-        if days_left < 0:               phase = "GERADE VORBEI"
-        elif days_left == 0:            phase = "HEUTE 🔴🔴🔴"
-        elif days_left <= ev["taper_days"]: phase = "TAPER 🟡"
-        elif days_left <= 7:            phase = "RACE WEEK 🔴"
-        elif days_left <= 14:           phase = "RACE SHARPENING 🟡"
-        elif days_left <= 35:           phase = "Spezifische Vorbereitung 🟢"
-        else:                           phase = "Basisaufbau 🟢"
-        result.append({**ev, "days_left": days_left, "phase": phase,
-                        "date_str": ev["date"].strftime("%d. %B %Y")})
-    return result
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 7. WORKOUT ENTSCHEIDUNG — VO2MAX-FOKUS (aktuelle Sportwissenschaft)
-# ═══════════════════════════════════════════════════════════════════
-def generate_workout_plan(metrics: dict, day_ctx: dict, events: list) -> dict:
-    """
-    Claude entscheidet Workout basierend auf polarisiertem Trainingsmodell
-    und aktueller VO2max-Forschung (Helgerud 2007, Buchheit & Laursen 2013,
-    Stöggl & Sperlich 2014 — 80/20 polarisiert > Schwellentraining).
-    """
-    client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    today_str = datetime.date.today().strftime("%A, %d. %B %Y")
-
-    sleep     = metrics.get("sleep", {})
-    hrv       = metrics.get("hrv", {})
-    readiness = metrics.get("readiness", {})
-    tl        = metrics.get("training_load", {})
-    bb        = metrics.get("body_battery_now", "?")
-    last_swim = metrics.get("last_swim")
-    last_run  = metrics.get("last_run")
-    last_bike = metrics.get("last_bike")
-
-    events_str = "\n".join([
-        f"- {ev['name']}: noch {ev['days_left']} Tage ({ev['phase']})"
-        for ev in events
-    ])
-
-    prompt = f"""Du bist Sportwissenschaftler für Hannes Raschke (20J, Amateur-Triathlet).
-Heute: {today_str} | Tagestyp: {day_ctx['type']} — {day_ctx['note']}
-
-METRIKEN:
-Sleep: {sleep.get('score','?')} ({sleep.get('freshness','')})
-HRV: {hrv.get('last_night_ms','?')}ms | Wochenschnitt: {hrv.get('weekly_avg_ms','?')}ms
-Readiness: {readiness.get('score','?')} [{readiness.get('level','')}]
-Body Battery: {bb}
-ATL/CTL/ACWR: {tl.get('atl','?')}/{tl.get('ctl','?')}/{tl.get('acwr','?')}
-
-LETZTE SESSIONS:
-Schwimmen: {f"{last_swim['days_ago']}d her, {last_swim['distance_m']}m" if last_swim else 'keine Daten'}
-Laufen: {f"{last_run['days_ago']}d her, {last_run['distance_m']}m" if last_run else 'keine Daten'}
-Radfahren: {f"{last_bike['days_ago']}d her, {last_bike['distance_m']}m" if last_bike else 'keine Daten'}
-
-EVENTS:
-{events_str}
-
-HANNES PROFIL:
-HFmax 196bpm | Z2 (aerob): 118-137bpm | LT: 176bpm | Z5 VO2max: >176bpm
-5km PR: 26:58 (5:24/km) | VO2max Garmin: 47 | Biometrisch: 50.6
-KERN-PROBLEM: 79% Laufzeit in Z4 (Junk-Zone), 0% in echtem Z2
-Polar H9 Brustgurt verfügbar
-
-SPORTWISSENSCHAFTLICHE GRUNDLAGE (aktuelle Studien):
-1. POLARISIERTES TRAINING (Stöggl & Sperlich 2014, Seiler):
-   - 80% der Sessions: Z1-Z2 (118-137bpm) — baut aerobes Fundament, erhöht Schlagvolumen
-   - 20%: Z4-Z5 (>167bpm) — direkter VO2max-Stimulus
-   - Z3 (Junk-Zone, 137-167bpm) VERMEIDEN — zu hart für Regeneration, zu leicht für VO2max
-
-2. BESTE VO2MAX-PROTOKOLLE (Helgerud et al. 2007, Buchheit & Laursen 2013):
-   - 4×4min @ 90-95% HFmax (176-186bpm) + 3min aktive Pause = GOLD-STANDARD
-   - 8-10×1min @ 95%+ HFmax + 1-2min Pause = schnellere Adaptation
-   - Schwellen-Radeinheiten: 3×10min @ 80-85% HFmax (157-166bpm) + Ausdauer-Z2 davor
-
-3. AMATEUR-SPEZIFISCH:
-   - Nicht jeden Tag hart — echte Erholung ermöglicht Supercompensation
-   - Z2-Läufe bei 7:00-7:30/km fühlen sich zu langsam an — das ist korrekt!
-   - Garmin Readiness <50 oder ACWR >1.4: NUR Z2 oder Ruhe
-
-4. TAPER-PHILOSOPHIE FÜR AMATEURE:
-   - Sprint-Triathlon: nur 5 Tage, Volumen -20%, KEINE komplette Trainings-Pause
-   - Intensität halten — ein kurzer Sharpener 3-4 Tage vor dem Rennen ist ok
-   - Kein wochenlanger Ultra-Taper — das ist für Profis
-
-ENTSCHEIDE DAS HEUTIGE TRAINING. Gib GENAU dieses JSON zurück (kein Markdown, kein Text):
-
-{{
-  "decision": "TRAIN",
-  "reason": "2-3 Sätze mit konkreten Metrik-Werten und sportwiss. Begründung",
-  "workout": {{
-    "sport": "running",
-    "name": "Name max 40 Zeichen",
-    "description": "Für Garmin Connect",
-    "steps": [
-      {{
-        "phase": "warmup|interval|recovery|cooldown|active",
-        "name": "Schrittname",
-        "end_type": "distance|time",
-        "end_value": 2000,
-        "end_unit": "meter|second",
-        "hr_min": 118,
-        "hr_max": 137,
-        "repeats": 1
-      }}
-    ]
-  }}
-}}
-
-ODER: {{"decision": "REST", "reason": "Begründung", "workout": null}}
-
-STEP-REGELN:
-- repeats>1: interval+recovery mit gleicher Zahl bilden Wiederholungsgruppe
-- distance in Metern, time in Sekunden
-- warmup/cooldown/active: repeats=1
-
-BEISPIEL 4×4min: warmup 2000m Z2 → interval 240s @176-186bpm ×4 → recovery 180s @Z1 ×4 → cooldown 1500m Z2
-BEISPIEL Z2 Lauf: active 10000m @118-137bpm ×1
-BEISPIEL Sharpener: warmup 1500m → interval 600s @157-166bpm ×2 → recovery 300s ×2 → cooldown 1000m
-
-WICHTIG: Sei konkret und progressiv. Kein Vorschlagen von "leichtem Spaziergang".
-Bei FREIEM TAG: längere oder doppelte Sessions möglich.
-Swim sport="swimming", Bike sport="cycling"."""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    text = message.content[0].text.strip()
-    if text.startswith("```"):
-        text = "\n".join(text.split("\n")[1:])
-        if "```" in text: text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 8. GARMIN WORKOUT BAUEN
-# ═══════════════════════════════════════════════════════════════════
-def build_garmin_workout(workout_plan: dict, today: datetime.date) -> dict:
-    SPORT_TYPES = {
-        "running":  {"sportTypeId": 1, "sportTypeKey": "running",      "displayOrder": 1},
-        "cycling":  {"sportTypeId": 2, "sportTypeKey": "cycling",      "displayOrder": 2},
-        "swimming": {"sportTypeId": 5, "sportTypeKey": "lap_swimming", "displayOrder": 5},
-        "other":    {"sportTypeId": 4, "sportTypeKey": "other",        "displayOrder": 4},
-    }
-    STEP_TYPES = {
-        "warmup":   {"stepTypeId": 1, "stepTypeKey": "warmup",   "displayOrder": 1},
-        "cooldown": {"stepTypeId": 2, "stepTypeKey": "cooldown", "displayOrder": 2},
-        "interval": {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
-        "recovery": {"stepTypeId": 4, "stepTypeKey": "recovery", "displayOrder": 4},
-        "active":   {"stepTypeId": 3, "stepTypeKey": "interval", "displayOrder": 3},
-        "rest":     {"stepTypeId": 5, "stepTypeKey": "rest",     "displayOrder": 5},
-    }
-    END_COND = {
-        "distance": {"conditionTypeId": 3, "conditionTypeKey": "distance",  "displayOrder": 3, "displayable": True},
-        "time":     {"conditionTypeId": 2, "conditionTypeKey": "time",      "displayOrder": 2, "displayable": True},
-    }
-    ITER_COND = {"conditionTypeId": 7, "conditionTypeKey": "iterations", "displayOrder": 7, "displayable": False}
-    HR_TARGET = {"workoutTargetTypeId": 4, "workoutTargetTypeKey": "heart.rate.zone", "displayOrder": 4}
-    NO_TARGET = {"workoutTargetTypeId": 1, "workoutTargetTypeKey": "no.target",       "displayOrder": 1}
-
-    sport      = workout_plan.get("sport", "running")
-    sport_type = SPORT_TYPES.get(sport, SPORT_TYPES["running"])
-    steps_in   = workout_plan.get("steps", [])
-    counter    = {"id": 0}
-
-    def next_id():
-        counter["id"] += 1
-        return counter["id"]
-
-    def make_exec(step, order):
-        phase  = step.get("phase", "active")
-        et     = step.get("end_type", "distance")
-        ev_val = float(step.get("end_value", 1000))
-        hr_min = step.get("hr_min"); hr_max = step.get("hr_max")
-        has_hr = bool(hr_min and hr_max)
-        return {
-            "type": "ExecutableStepDTO", "stepId": next_id(), "stepOrder": order,
-            "stepType": STEP_TYPES.get(phase, STEP_TYPES["interval"]),
-            "childStepId": None, "description": step.get("name",""),
-            "endCondition": END_COND.get(et, END_COND["distance"]),
-            "endConditionValue": ev_val, "preferredEndConditionUnit": None,
-            "endConditionCompare": None,
-            "targetType": HR_TARGET if has_hr else NO_TARGET,
-            "targetValueOne": float(hr_min) if has_hr else None,
-            "targetValueTwo": float(hr_max) if has_hr else None,
-            "zoneNumber": None,
-        }
-
-    garmin_steps = []; order = 1; i = 0
-    while i < len(steps_in):
-        step = steps_in[i]
-        rep  = step.get("repeats", 1)
-        if rep > 1:
-            group = []
-            while i < len(steps_in) and steps_in[i].get("repeats",1) == rep:
-                group.append(steps_in[i]); i += 1
-            repeat_id = next_id()
-            inner = [make_exec(gs, io+1) for io, gs in enumerate(group)]
-            garmin_steps.append({
-                "type": "RepeatGroupDTO", "stepId": repeat_id, "stepOrder": order,
-                "stepType": {"stepTypeId": 6, "stepTypeKey": "repeat", "displayOrder": 6},
-                "childStepId": 1, "numberOfIterations": rep, "smartRepeat": False,
-                "endCondition": ITER_COND, "endConditionValue": float(rep),
-                "workoutSteps": inner, "skipLastRestStep": False,
-            })
-            order += 1
-        else:
-            garmin_steps.append(make_exec(step, order)); order += 1; i += 1
-
-    return {
-        "workoutName": workout_plan.get("name", f"Training {today.isoformat()}"),
-        "description": workout_plan.get("description",""),
-        "sportType": sport_type, "subSportType": None,
-        "workoutSegments": [{"segmentOrder": 1, "sportType": sport_type, "workoutSteps": garmin_steps}],
-    }
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 9. WORKOUT HOCHLADEN
-# ═══════════════════════════════════════════════════════════════════
-def upload_workout_to_garmin(client: Garmin, workout_dict: dict, today: datetime.date) -> dict:
-    def extract_id(r):
-        if isinstance(r, dict): return r.get("workoutId") or r.get("id") or r.get("workout_id")
-        try: return int(r)
-        except: return None
-
-    def try_schedule(wid):
-        try:
-            client.garth.connectapi(f"/workout-service/schedule/{wid}", method="POST", json={"date": today.isoformat()})
-            print(f"   ✓ Für {today.isoformat()} geplant"); return True
-        except Exception as e:
-            print(f"   Scheduling Fehler: {e}"); return False
-
-    workout_id = None; upload_method = None
-
-    if hasattr(client, "garth"):
-        try:
-            result = client.garth.connectapi("/workout-service/workout", method="POST", json=workout_dict)
-            workout_id = extract_id(result)
-            if workout_id: upload_method = "garth.connectapi"; print(f"   ✓ Workout ID: {workout_id}")
-        except Exception as e: print(f"   connectapi Fehler: {str(e)[:100]}")
-
-    if not workout_id and hasattr(client, "garth"):
-        try:
-            resp = client.garth.post("connectapi", "/workout-service/workout", json=workout_dict, api=True)
-            result = resp.json() if hasattr(resp, "json") else resp
-            workout_id = extract_id(result)
-            if workout_id: upload_method = "garth.post"; print(f"   ✓ Workout ID: {workout_id}")
-        except Exception as e: print(f"   garth.post Fehler: {str(e)[:100]}")
-
-    if not workout_id and hasattr(client, "add_workout"):
-        try:
-            result = client.add_workout(workout_dict)
-            workout_id = extract_id(result)
-            if workout_id: upload_method = "add_workout"; print(f"   ✓ Workout ID: {workout_id}")
-        except Exception as e: print(f"   add_workout Fehler: {str(e)[:100]}")
-
-    if workout_id:
-        scheduled = try_schedule(workout_id)
-        return {
-            "success": True, "workout_id": workout_id, "scheduled": scheduled,
-            "method": upload_method,
-            "message": "Workout erstellt und geplant ✓" if scheduled else "Workout erstellt ✓ (Garmin Connect → Meine Workouts)",
-            "garmin_link": f"https://connect.garmin.com/modern/workout/{workout_id}"
-        }
-    return {"success": False, "workout_id": None,
-            "message": "Upload fehlgeschlagen — Session manuell starten"}
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 10. HTML DASHBOARD
-# ═══════════════════════════════════════════════════════════════════
-def generate_dashboard(garmin_data: dict, metrics: dict, day_ctx: dict,
-                       events: list, workout_plan: dict, workout_status: dict) -> str:
-    client    = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
-    today     = datetime.date.today()
-    today_str = today.strftime("%A, %d. %B %Y")
-
-    last_swim     = metrics.get("last_swim", {})
-    swim_days_ago = (last_swim.get("days_ago") or 999) if last_swim else 999
-    swim_warning  = ""
-    for ev in events:
-        if "triathlon" in ev.get("type",""):
-            if swim_days_ago >= 14:
-                swim_warning = f"🚨 KRITISCH: {swim_days_ago} Tage kein Schwimmen! {ev['name']} in {ev['days_left']} Tagen."
-            elif swim_days_ago >= 7:
-                swim_warning = f"⚠️ {swim_days_ago} Tage kein Schwimmen. Dringend ins Wasser."
-
-    if workout_plan.get("decision") == "REST":
-        workout_banner = f"WORKOUT: RUHETAG\n{workout_plan.get('reason','')}"
-    elif workout_status.get("success"):
-        w = workout_plan.get("workout", {})
-        steps_s = " → ".join(
-            f"{s.get('phase')} {s.get('end_value')}{s.get('end_unit','')}"
-            + (f"×{s.get('repeats')}" if s.get("repeats",1)>1 else "")
-            for s in w.get("steps",[])
-        )
-        workout_banner = (f"WORKOUT: ✅ IN GARMIN CONNECT\nName: {w.get('name','')}\n"
-                          f"Sport: {w.get('sport','')}\nStruktur: {steps_s}\n"
-                          f"Begründung: {workout_plan.get('reason','')}\n"
-                          f"Status: {workout_status.get('message','')}")
-        if workout_status.get("garmin_link"):
-            workout_banner += f"\nLink: {workout_status['garmin_link']}"
-    else:
-        w = workout_plan.get("workout", {}) or {}
-        workout_banner = (f"WORKOUT: ⚠️ UPLOAD FEHLGESCHLAGEN\nName: {w.get('name','?')}\n"
-                          f"Begründung: {workout_plan.get('reason','')}\n"
-                          f"Fehler: {workout_status.get('message','')}\n"
-                          f"→ Session manuell starten")
-
-    events_str = "".join(
-        f"\n{ev['emoji']} {ev['name']}: {ev['days_left']}d | {ev['phase']}\n"
-        f"  {ev['distance']} | {ev['goal']}\n  Taper: {ev['taper_style']}\n"
-        for ev in events
-    )
-    free_str  = ", ".join(f"{d['weekday']} ({d['name']}, +{d['days_from_now']}d)"
-                          for d in day_ctx.get("upcoming_free_days",[])[:4]) or "keine"
-    acts_str  = json.dumps(garmin_data.get("activities",[])[:10], indent=1, default=str)[:6000]
-    sleep_str = json.dumps(garmin_data.get("sleep",[])[:7], indent=1, default=str)[:4000]
-    metr_str  = json.dumps(metrics, indent=2, ensure_ascii=False)
-
-    prompt = f"""Erstelle das tägliche Trainings-Dashboard für Hannes Raschke ({today_str}).
-{swim_warning}
-
-KONTEXT: {day_ctx['type']} | {day_ctx['note']} | Freie Tage: {free_str}
-METRIKEN: {metr_str}
-{workout_banner}
-EVENTS: {events_str}
-AKTIVITÄTEN (letzte 10): {acts_str}
-SCHLAF (7 Nächte): {sleep_str}
-
-ERSTELLE VOLLSTÄNDIGES STANDALONE HTML. Kein CDN, alles inline, Mobil-first 375px.
-Hintergrund #080c08 | Grün #4cff7c | Amber #ffb84c | Rot #ff6060 | Text #ddeedd
-Schrift: -apple-system, BlinkMacSystemFont, sans-serif
-
-REIHENFOLGE (PFLICHT):
-[1] HEADER — "Guten Morgen Hannes — {today_str}"
-[2] METRIKEN — große KPIs mit Ampeln:
-    Sleep | HRV ms | Readiness | Body Battery | RHR | ACWR
-    Freshness-Label unter jedem Wert. Ampelregeln: Sleep≥85=grün,<70=rot | HRV≥63=grün,<50=rot
-    Readiness≥80=grün | BB≥70=grün | RHR≤58=grün,≥65=rot | ACWR 0.8-1.3=grün
-[3] WORKOUT STATUS — farbige Box:
-    ✅ Grün: Name + HR-Zonen + "Uhr synchronisieren"
-    🔴 Rest: Ruhetag + Grund
-    ⚠️ Amber: Manuell starten + Session-Beschreibung
-[4] TRAININGSEMPFEHLUNG — Details, HR-Zonen, Tipps
-[5] NÄCHSTE 5 TAGE — polarisiertes Wochenprogramm mit Z2/Intervall-Balance
-[6] EVENTS — kompakte Karten mit Disziplin-Ampeln und Countdown
-[7] SCHLAF-TABELLE — 7 Nächte kompakt
-[8] LETZTE 7 TRAININGS — Liste
-[9] TRAINING LOAD — wenn verfügbar
-
-INTELLIGENZ:
-- ACWR>1.4: roter Banner oben
-- Readiness<50: Pflichtruhe-Banner
-- Race Week (<7d): Race-Week-Modus
-- Beim Workout-Banner: wenn ✅ → zeige Garmin-Link als klickbaren Button
-
-Antworte NUR mit HTML, direkt ab <!DOCTYPE html>."""
-
-    message = client.messages.create(
-        model="claude-sonnet-4-6", max_tokens=8000,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    html = message.content[0].text.strip()
-    if html.startswith("```"):
-        html = "\n".join(html.split("\n")[1:])
-        if "```" in html: html = html.rsplit("```",1)[0]
-    return html.strip()
-
-
-# ═══════════════════════════════════════════════════════════════════
-# 11. E-MAIL
-# ═══════════════════════════════════════════════════════════════════
-def send_email(html_content: str, date_str: str):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🏃 {date_str} — Garmin Dashboard"
-    msg["From"]    = GMAIL_USER
-    msg["To"]      = GMAIL_TO
-    msg.attach(MIMEText(f"Dashboard für {date_str}.", "plain","utf-8"))
-    msg.attach(MIMEText(html_content, "html","utf-8"))
-    with smtplib.SMTP("smtp.mail.me.com", 587) as server:
-        server.ehlo(); server.starttls(); server.ehlo()
-        server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_USER, GMAIL_TO, msg.as_string())
-
-
-# ═══════════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════════
 def main():
-    today     = datetime.date.today()
-    today_str = today.strftime("%d. %m. %Y")
-    print(f"\n{'='*54}\n  Garmin Dashboard — {today_str}\n{'='*54}\n")
+    if already_sent_today():
+        log.info("Dashboard already sent today — exiting.")
+        return
 
-    try:
-        print("1/6 — Garmin Login...")
-        garmin_client = get_garmin_client()
+    log.info("Connecting to Garmin...")
+    garmin = garmin_connect()
 
-        print("1b/6 — Warte auf Sleep Score (max 4h)...")
-        wait_for_sleep_score(garmin_client, max_wait_min=240, poll_interval_sec=300)
+    log.info("Fetching data...")
+    data = fetch_all_data(garmin)
 
-        print("2/6 — Daten laden...")
-        garmin_data = get_garmin_data(garmin_client)
+    if not data["sleep"]["synced"]:
+        log.info("Sleep not yet synced — will retry later.")
+        return
 
-        print("3/6 — Kontext...")
-        metrics  = extract_fresh_metrics(garmin_data)
-        day_ctx  = get_day_context(today)
-        events   = get_events_context(today)
-        print(f"   {day_ctx['type']} | Events: {len(events)}")
+    log.info("Sleep synced. Building dashboard...")
+    race_ctx = race_context()
 
-        print("4/6 — Workout-Entscheidung...")
-        workout_plan = generate_workout_plan(metrics, day_ctx, events)
-        decision     = workout_plan.get("decision","REST")
-        print(f"   {decision}: {workout_plan.get('workout',{}).get('name','-') if workout_plan.get('workout') else 'Ruhetag'}")
+    claude = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-        workout_status = {"success": False, "message": "Ruhetag", "workout_id": None}
-        if decision == "TRAIN" and workout_plan.get("workout"):
-            print("5/6 — Workout hochladen...")
-            garmin_workout = build_garmin_workout(workout_plan["workout"], today)
-            workout_status = upload_workout_to_garmin(garmin_client, garmin_workout, today)
-            print(f"   {workout_status['message']}")
-        else:
-            print("5/6 — Ruhetag")
+    log.info("Calling Claude: today's workout...")
+    workout = build_todays_workout(claude, data, race_ctx)
 
-        print("6/6 — Dashboard generieren...")
-        html_dashboard = generate_dashboard(garmin_data, metrics, day_ctx, events, workout_plan, workout_status)
-        print(f"   {len(html_dashboard):,} Zeichen")
+    log.info("Calling Claude: week plan...")
+    week_plan = build_week_plan(claude, data, race_ctx)
 
-        send_email(html_dashboard, today_str)
-        print(f"\n✅ FERTIG — {GMAIL_TO}\n")
+    log.info("Rendering HTML...")
+    today_str = datetime.date.today().isoformat()
+    phase = race_ctx["phase"]
+    subject = f"🏋 Training {today_str} · {phase}"
+    if workout and workout.get("primary"):
+        p = workout["primary"]
+        subject = f"🏋 {p.get('title','Training')} · {p.get('duration_min','?')}min {p.get('intensity','')} · {phase}"
 
-    except Exception as e:
-        print(f"\n❌ FEHLER: {e}")
-        traceback.print_exc()
-        try:
-            err_html = f"""<!DOCTYPE html><html><body style="background:#1a0000;color:#ff8080;font-family:monospace;padding:20px">
-<h2>⚠️ Fehler — {today_str}</h2>
-<pre style="background:#2a0000;padding:15px;border-radius:8px;white-space:pre-wrap">{traceback.format_exc()}</pre>
-</body></html>"""
-            send_email(err_html, today_str)
-        except: pass
-        raise
+    html = build_html(data, workout, week_plan, race_ctx)
+
+    log.info("Sending email...")
+    sent = send_email(html, subject)
+
+    if sent:
+        mark_sent()
+        log.info("Uploading workout to Garmin...")
+        upload_workout_to_garmin(workout, garmin)
+        log.info("Done.")
+    else:
+        log.error("Email failed — not marking as sent.")
+        exit(1)
 
 
 if __name__ == "__main__":
