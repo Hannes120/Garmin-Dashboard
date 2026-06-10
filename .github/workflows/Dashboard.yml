@@ -1,0 +1,57 @@
+name: Training Dashboard
+
+on:
+  schedule:
+    # Every 30 min from 03:00–09:30 UTC (= 05:00–11:30 CEST)
+    # Covers sleeping in until ~11:00, and early risers at ~05:50
+    - cron: "0,30 3,4,5,6,7,8,9 * * *"
+    # Also at 03:30 UTC (= 05:30 CEST) as main weekday target
+    - cron: "30 3 * * 1-5"
+  workflow_dispatch:   # manual trigger for testing
+
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    # Cache the "already sent today" flag across runs
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore sent-state cache
+        uses: actions/cache@v4
+        with:
+          path: /tmp/dashboard_sent_date.txt
+          key: dashboard-sent-${{ github.run_id }}
+          restore-keys: |
+            dashboard-sent-
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install garminconnect garth anthropic
+
+      - name: Run dashboard
+        env:
+          GARMIN_EMAIL:        ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD:     ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_MFA:          ${{ secrets.GARMIN_MFA }}
+          GARM_TOKENS_DIR:     /tmp/garmin_tokens
+          ANTHROPIC_API_KEY:   ${{ secrets.ANTHROPIC_API_KEY }}
+          ICLOUD_EMAIL:        ${{ secrets.ICLOUD_EMAIL }}
+          ICLOUD_APP_PASSWORD: ${{ secrets.ICLOUD_APP_PASSWORD }}
+          DASHBOARD_TO:        ${{ secrets.DASHBOARD_TO }}
+        run: python dashboard.py
+
+      - name: Save sent-state cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/dashboard_sent_date.txt
+          key: dashboard-sent-${{ github.run_id }}
