@@ -22,7 +22,7 @@ RACE_CALENDAR = [
 ]
 
 POLARIZED_TARGET = 0.80   # 80% easy
-ANTHROPIC_MODEL  = "claude-sonnet-4-20250514"
+ANTHROPIC_MODEL  = "claude-sonnet-4-6"
 
 # ─── Garmin ───────────────────────────────────────────────────────────────────
 
@@ -642,7 +642,8 @@ def send_email(html, subject):
 
     for attempt in range(3):
         try:
-            with smtplib.SMTP_SSL("smtp.mail.me.com", 587) as s:
+            with smtplib.SMTP("smtp.mail.me.com", 587) as s:
+                s.starttls()
                 s.login(smtp_user, smtp_pass)
                 s.sendmail(smtp_user, to_addr, msg.as_string())
             log.info(f"Email sent to {to_addr}")
