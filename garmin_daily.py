@@ -276,6 +276,261 @@ def fetch_training_readiness(client, today):
     return None
 
 
+# ─── Trainingslast (Garmin native: ATL/CTL/ACWR) ───────────────────────────────
+# Wichtig: trainingStressScore fehlt in der Aktivitätsliste fast immer.
+# get_training_status() liefert die echte akute/chronische Last direkt.
+
+def _extract_training_load(status):
+    """Holt akute/chronische Last + ACWR + Status-Phrase aus get_training_status().
+    Robust gegen die verschachtelte, nach Device-ID geschlüsselte Struktur."""
+    out = {"atl": None, "ctl": None, "acwr": None,
+           "weekly_load": None, "status_phrase": None, "vo2max": None}
+    if not isinstance(status, dict):
+        return out
+
+    # VO2max aus dem Training-Status als zusätzliche Fallback-Quelle
+    v = status.get("mostRecentVO2Max")
+    if isinstance(v, dict):
+        gen = v.get("generic") or {}
+        out["vo2max"] = gen.get("vo2MaxPreciseValue") or gen.get("vo2MaxValue")
+
+    mrts   = status.get("mostRecentTrainingStatus") or {}
+    latest = mrts.get("latestTrainingStatusData") or {}
+    device = None
+    if isinstance(latest, dict):
+        for _, val in latest.items():
+            if isinstance(val, dict):
+                device = val
+                break
+    if not isinstance(device, dict):
+        return out
+
+    out["weekly_load"]   = device.get("weeklyTrainingLoad")
+    out["status_phrase"] = (device.get("trainingStatusFeedbackPhrase")
+                            or device.get("trainingStatus"))
+
+    acute = device.get("acuteTrainingLoadDTO") or {}
+    if isinstance(acute, dict):
+        out["atl"]  = _num(acute.get("dailyTrainingLoadAcute"))
+        out["ctl"]  = _num(acute.get("dailyTrainingLoadChronic"))
+        out["acwr"] = (_num(acute.get("dailyAcuteChronicWorkloadRatio"))
+                       or _num(acute.get("acwrPercent")))
+    return out
+
+
+def fetch_training_load(client, today):
+    status = safe_get(lambda: client.get_training_status(today.isoformat()),
+                      None, "training_status")
+    return _extract_training_load(status)
+
+
+# ─── Verlaufs-Historie (für die Diagramme) ─────────────────────────────────────
+
+HISTORY_FILE     = os.environ.get("HISTORY_FILE", "/tmp/garmin_history.json")
+HISTORY_MAX_DAYS = 180
+VO2MAX_GOAL      = float(os.environ.get("VO2MAX_GOAL", "50"))  # <- anpassen!
+
+
+def load_history():
+    try:
+        with open(HISTORY_FILE) as f:
+            h = json.load(f)
+        return h if isinstance(h, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
+
+
+def update_history(data):
+    """Hängt den heutigen Snapshot an (oder ersetzt ihn), trimmt und schreibt
+    die Historie zurück. Gibt die sortierte Historie für build_html zurück."""
+    hist = load_history()
+    today = data["date"]
+    body, load, sleep = data["body"], data["load"], data["sleep"]
+    snap = {
+        "date":        today,
+        "vo2max":      body.get("vo2max"),
+        "sleep_score": sleep.get("score"),
+        "ctl":         load.get("ctl"),
+        "atl":         load.get("atl"),
+        "tsb":         load.get("tsb"),
+        "acwr":        load.get("acwr"),
+        "load":        load.get("weekly_load") or load.get("atl"),
+    }
+    hist = [e for e in hist if isinstance(e, dict) and e.get("date") != today]
+    hist.append(snap)
+    hist.sort(key=lambda e: e.get("date", ""))
+    if len(hist) > HISTORY_MAX_DAYS:
+        hist = hist[-HISTORY_MAX_DAYS:]
+    try:
+        with open(HISTORY_FILE, "w") as f:
+            json.dump(hist, f)
+    except OSError as e:
+        log.warning(f"Historie konnte nicht geschrieben werden: {e}")
+    return hist
+
+
+# ─── SVG-Diagramme (inline, E-Mail-tauglich) ───────────────────────────────────
+
+def svg_trend_chart(points, *, color="#4a78e0", goal=None, goal_label="Ziel",
+                    unit="", height=150, width=524, fmt="{:.0f}"):
+    """points: [(date_str, value)], value darf None sein (wird übersprungen).
+    Inline-SVG-Liniendiagramm mit Flächenfüllung, Endpunkt-Label und optionaler
+    gestrichelter Ziel-Linie."""
+    pts = [(d, v) for d, v in points if v is not None]
+    if len(pts) < 2:
+        return ('<div style="font-size:12px;color:#aaa;padding:12px 0;">'
+                '⏳ Sammelt noch Daten — der Verlauf erscheint nach ein paar Tagen.</div>')
+
+    pad_l, pad_r, pad_t, pad_b = 8, 46, 16, 20
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+
+    vals = [v for _, v in pts]
+    lo, hi = min(vals), max(vals)
+    if goal is not None:
+        lo, hi = min(lo, goal), max(hi, goal)
+    span = (hi - lo) or 1
+    lo -= span * 0.12
+    hi += span * 0.12
+
+    n = len(pts)
+    def X(i): return pad_l + (i / (n - 1)) * plot_w
+    def Y(v): return pad_t + (1 - (v - lo) / (hi - lo)) * plot_h
+
+    line = " ".join(f"{X(i):.1f},{Y(v):.1f}" for i, (_, v) in enumerate(pts))
+    area = (f"{pad_l:.1f},{pad_t + plot_h:.1f} " + line +
+            f" {pad_l + plot_w:.1f},{pad_t + plot_h:.1f}")
+
+    grid = ""
+    for frac in (0.25, 0.5, 0.75):
+        gy = pad_t + frac * plot_h
+        grid += (f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{pad_l + plot_w}" '
+                 f'y2="{gy:.1f}" stroke="#eee" stroke-width="1"/>')
+
+    goal_svg = ""
+    if goal is not None:
+        gy = Y(goal)
+        goal_svg = (f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{pad_l + plot_w}" '
+                    f'y2="{gy:.1f}" stroke="#e05c4a" stroke-width="1.5" '
+                    f'stroke-dasharray="4,3"/>'
+                    f'<text x="{pad_l + plot_w + 4}" y="{gy + 3:.1f}" font-size="10" '
+                    f'fill="#e05c4a">{goal_label} {fmt.format(goal)}</text>')
+
+    lx, lv = X(n - 1), pts[-1][1]
+    ly = Y(lv)
+    end_dot = (f'<circle cx="{lx:.1f}" cy="{ly:.1f}" r="3.5" fill="{color}"/>'
+               f'<text x="{lx - 6:.1f}" y="{ly - 7:.1f}" font-size="11" '
+               f'font-weight="700" fill="{color}" text-anchor="end">'
+               f'{fmt.format(lv)}{unit}</text>')
+
+    xl = (f'<text x="{pad_l}" y="{height - 5}" font-size="9" fill="#bbb">'
+          f'{pts[0][0][5:]}</text>'
+          f'<text x="{pad_l + plot_w}" y="{height - 5}" font-size="9" fill="#bbb" '
+          f'text-anchor="end">{pts[-1][0][5:]}</text>')
+
+    return (f'<svg width="100%" viewBox="0 0 {width} {height}" '
+            f'xmlns="http://www.w3.org/2000/svg" '
+            f'style="display:block;max-width:{width}px;">'
+            f'{grid}<polygon points="{area}" fill="{color}" opacity="0.08"/>'
+            f'<polyline points="{line}" fill="none" stroke="{color}" '
+            f'stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>'
+            f'{goal_svg}{end_dot}{xl}</svg>')
+
+
+def vo2max_section(history):
+    pts = [(e["date"], e.get("vo2max")) for e in history]
+    chart = svg_trend_chart(pts, color="#4a78e0", goal=VO2MAX_GOAL,
+                            goal_label="Ziel", fmt="{:.1f}")
+    cur = next((e["vo2max"] for e in reversed(history)
+                if e.get("vo2max") is not None), None)
+    if cur is None:
+        note = "Noch kein VO₂max-Wert vorhanden."
+    elif cur >= VO2MAX_GOAL:
+        note = (f'<span style="color:#3aaa6e;font-weight:700;">✓ Ziel erreicht — '
+                f'{cur:.1f} ≥ {VO2MAX_GOAL:.0f}</span>')
+    else:
+        note = (f'aktuell <b>{cur:.1f}</b> · Ziel <b>{VO2MAX_GOAL:.0f}</b> · '
+                f'noch <b style="color:#e05c4a;">+{VO2MAX_GOAL - cur:.1f}</b>')
+    return chart, note
+
+
+def svg_sleep_load_chart(history, *, height=150, width=524):
+    """Schlaf-Score als farbcodierte Balken (0–100) + akute Belastung als Linie."""
+    rows = [(e["date"], e.get("sleep_score"), e.get("load")) for e in history]
+    sval = [s for _, s, _ in rows if s is not None]
+    lval = [l for _, _, l in rows if l is not None]
+    if len(rows) < 2 or (not sval and not lval):
+        return ('<div style="font-size:12px;color:#aaa;padding:12px 0;">'
+                '⏳ Sammelt noch Daten — Schlaf/Belastung erscheinen nach ein paar Tagen.</div>')
+
+    pad_l, pad_r, pad_t, pad_b = 8, 8, 18, 20
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+    n = len(rows)
+    def X(i): return pad_l + (i / (n - 1)) * plot_w if n > 1 else pad_l + plot_w / 2
+
+    bw = max(plot_w / n * 0.55, 3)
+    bars = ""
+    for i, (d, s, l) in enumerate(rows):
+        if s is None:
+            continue
+        bh = (s / 100) * plot_h
+        x = X(i) - bw / 2
+        y = pad_t + plot_h - bh
+        col = "#3aaa6e" if s >= 80 else "#f5a623" if s >= 60 else "#e05c4a"
+        bars += (f'<rect x="{x:.1f}" y="{y:.1f}" width="{bw:.1f}" '
+                 f'height="{bh:.1f}" rx="2" fill="{col}" opacity="0.5"/>')
+
+    load_svg = ""
+    if len(lval) >= 2:
+        lo, hi = min(lval), max(lval)
+        span = (hi - lo) or 1
+        lo -= span * 0.15
+        hi += span * 0.15
+        def Yl(v): return pad_t + (1 - (v - lo) / (hi - lo)) * plot_h
+        seg = " ".join(f"{X(i):.1f},{Yl(l):.1f}"
+                       for i, (d, s, l) in enumerate(rows) if l is not None)
+        load_svg = (f'<polyline points="{seg}" fill="none" stroke="#1a1a2e" '
+                    f'stroke-width="2" stroke-linejoin="round"/>')
+
+    legend = ('<rect x="8" y="4" width="10" height="9" rx="2" fill="#3aaa6e" '
+              'opacity="0.5"/><text x="22" y="12" font-size="10" fill="#888">'
+              'Schlaf-Score</text>'
+              '<line x1="110" y1="9" x2="126" y2="9" stroke="#1a1a2e" '
+              'stroke-width="2"/><text x="130" y="12" font-size="10" '
+              'fill="#888">Belastung</text>')
+
+    xl = (f'<text x="{pad_l}" y="{height - 5}" font-size="9" fill="#bbb">'
+          f'{rows[0][0][5:]}</text>'
+          f'<text x="{pad_l + plot_w}" y="{height - 5}" font-size="9" fill="#bbb" '
+          f'text-anchor="end">{rows[-1][0][5:]}</text>')
+
+    return (f'<svg width="100%" viewBox="0 0 {width} {height}" '
+            f'xmlns="http://www.w3.org/2000/svg" '
+            f'style="display:block;max-width:{width}px;">'
+            f'{bars}{load_svg}{legend}{xl}</svg>')
+
+
+def load_status_line(load):
+    """Kleine Textzeile mit ACWR + Garmin-Trainingsstatus unter dem Diagramm."""
+    acwr = load.get("acwr")
+    phrase = load.get("status_phrase")
+    parts = []
+    if acwr is not None:
+        ratio = acwr / 100 if acwr > 5 else acwr  # Prozent -> Ratio normalisieren
+        if   ratio < 0.8:  col, tag = "#3aaa6e", "unterfordert"
+        elif ratio <= 1.3: col, tag = "#3aaa6e", "optimal"
+        elif ratio <= 1.5: col, tag = "#f5a623", "erhöht"
+        else:              col, tag = "#e05c4a", "Überlastung"
+        parts.append(f'ACWR <b style="color:{col};">{ratio:.2f}</b> ({tag})')
+    if phrase:
+        nice = str(phrase).replace("_", " ").title()
+        parts.append(f'Status: <b>{nice}</b>')
+    if not parts:
+        return ""
+    return ('<div style="font-size:12px;color:#555;margin-top:6px;">'
+            + ' · '.join(parts) + '</div>')
+
+
+
 def fetch_all_data(client):
     today = today_local()
     two_weeks_ago = today - datetime.timedelta(days=14)
@@ -363,11 +618,22 @@ def fetch_all_data(client):
     else:
         zone_pct, easy_pct = {}, None
 
-    # ── Load (ATL/CTL/TSB aus TSS) ──
+    # ── Load: Garmin-native (ATL/CTL/ACWR) bevorzugt, TSS nur als Fallback ──
+    # trainingStressScore fehlt in der Aktivitätsliste fast immer -> deshalb war
+    # CTL/TSB bisher meist leer. get_training_status() liefert die echte Last.
+    tl = fetch_training_load(client, today)
+
     tss_values = [a["tss"] for a in activities if a["tss"] is not None]
-    atl = round(statistics.mean(tss_values[-7:]),  1) if len(tss_values) >= 3 else None
-    ctl = round(statistics.mean(tss_values[-42:]), 1) if len(tss_values) >= 7 else None
+    atl_tss = round(statistics.mean(tss_values[-7:]),  1) if len(tss_values) >= 3 else None
+    ctl_tss = round(statistics.mean(tss_values[-42:]), 1) if len(tss_values) >= 7 else None
+
+    atl = tl["atl"] if tl["atl"] is not None else atl_tss
+    ctl = tl["ctl"] if tl["ctl"] is not None else ctl_tss
     tsb = round(ctl - atl, 1) if (atl is not None and ctl is not None) else None
+
+    # VO2max-Fallback aus dem Training-Status, falls Stats/MaxMetrics nichts hatten
+    if vo2max is None and tl.get("vo2max") is not None:
+        vo2max = tl["vo2max"]
 
     return {
         "date": today.isoformat(),
@@ -377,7 +643,9 @@ def fetch_all_data(client):
             "steps": steps, "calories": calories, "vo2max": vo2max,
             "readiness": readiness,
         },
-        "load": {"atl": atl, "ctl": ctl, "tsb": tsb},
+        "load": {"atl": atl, "ctl": ctl, "tsb": tsb,
+                 "acwr": tl.get("acwr"), "weekly_load": tl.get("weekly_load"),
+                 "status_phrase": tl.get("status_phrase")},
         "zones_7d": {"totals_min": zone_totals, "pct": zone_pct, "easy_pct": easy_pct},
         "activities_14d": activities,
         "recent_count": len(recent_acts),
@@ -738,7 +1006,8 @@ def week_plan_table(plan):
     <div style="margin-top:8px;font-size:11px;color:#888;font-style:italic;">{plan.get('weekly_load_note','')}</div>"""
 
 
-def build_html(data, workout, week_plan, race_ctx):
+def build_html(data, workout, week_plan, race_ctx, history=None):
+    history = history or []
     today = today_local()
     weekday_de = ["Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"][today.weekday()]
     months_de = ["Januar", "Februar", "März", "April", "Mai", "Juni", "Juli", "August", "September", "Oktober", "November", "Dezember"]
@@ -785,6 +1054,10 @@ def build_html(data, workout, week_plan, race_ctx):
           <td style="padding:6px 10px;"><div style="background:#e8e8f0;border-radius:4px;width:120px;height:8px;overflow:hidden;"><div style="background:{phase_color};width:{bar_w}px;height:8px;border-radius:4px;"></div></div></td>
           <td style="padding:6px 0;font-size:12px;color:#888;">{days}d · {r.get('goal','')}</td>
         </tr>"""
+
+    vo2_chart, vo2_note = vo2max_section(history)
+    sleepload_chart = svg_sleep_load_chart(history)
+    load_line = load_status_line(load)
 
     return f"""<!DOCTYPE html>
 <html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Training {today.isoformat()}</title></head>
@@ -834,6 +1107,18 @@ def build_html(data, workout, week_plan, race_ctx):
     <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;">Zonenverteilung (7 Tage)</div>
     <table cellpadding="0" cellspacing="0">{zbars}</table>
     <div style="margin-top:8px;font-size:12px;">{polarized_status}</div>
+  </div>
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;">VO₂max · Verlauf &amp; Ziel</div>
+    {vo2_chart}
+    <div style="font-size:12px;color:#555;margin-top:2px;">{vo2_note}</div>
+  </div>
+  <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
+  <div style="padding:16px 20px 8px;">
+    <div style="font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:.8px;margin-bottom:6px;">Schlaf-Score &amp; Belastung (Verlauf)</div>
+    {sleepload_chart}
+    {load_line}
   </div>
   <div style="height:1px;background:#f0f0f0;margin:0 20px;"></div>
   <div style="padding:16px 20px 20px;">
@@ -950,6 +1235,9 @@ def main():
     log.info("Hole Daten...")
     data = fetch_all_data(garmin)
 
+    # Tages-Snapshot in die Verlaufs-Historie schreiben (für die Diagramme)
+    history = update_history(data)
+
     # WICHTIG: kein hartes Abbrechen mehr, wenn Schlaf fehlt.
     if not data["sleep"]["synced"]:
         log.warning("Schlaf noch nicht gesynct — fahre mit konservativer Planung fort.")
@@ -981,7 +1269,7 @@ def main():
     subject = (f"🏋 {p.get('title','Training')} · {p.get('duration_min','?')}min "
                f"{p.get('intensity','')} · {phase}")
 
-    html = build_html(data, workout, week_plan, race_ctx)
+    html = build_html(data, workout, week_plan, race_ctx, history)
     text = build_plaintext(data, workout, race_ctx)
 
     preview_path = os.environ.get("SAVE_HTML")
