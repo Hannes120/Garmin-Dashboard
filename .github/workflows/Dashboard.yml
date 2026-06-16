@@ -2,14 +2,18 @@ name: Training Dashboard
 
 on:
   schedule:
-    # Every 30 min from 03:00–09:30 UTC (= 05:00–11:30 CEST)
-    # Covers sleeping in until ~11:00, and early risers at ~05:50
-    - cron: "0,30 3,4,5,6,7,8,9 * * *"
-    # Also at 03:30 UTC (= 05:30 CEST) as main weekday target
-    - cron: "30 3 * * 1-5"
-  workflow_dispatch:   # manual trigger for testing
+    # Gezielt wenige Läufe statt alle 30 min (schont Garmin-Login / vermeidet Rate-Limits).
+    # Zeiten in UTC. Sommerzeit (CEST = UTC+2):
+    - cron: "30 4 * * *"   # 06:30 CEST  – Frühaufsteher
+    - cron: "30 6 * * *"   # 08:30 CEST  – Standard
+    - cron: "0 9 * * *"    # 11:00 CEST  – Langschläfer-Backup
+  workflow_dispatch:       # manueller Test
+    inputs:
+      force_send:
+        description: "Auch senden, wenn heute schon gesendet wurde"
+        required: false
+        default: "false"
 
-# Don't let overlapping cron runs clobber each other's caches.
 concurrency:
   group: training-dashboard
   cancel-in-progress: false
@@ -26,19 +30,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Compute local date (Europe/Berlin)
+        id: date
+        run: echo "today=$(TZ=Europe/Berlin date +%F)" >> "$GITHUB_OUTPUT"
+
+      # Sent-State: deterministisch nach Datum gecacht → genau 1 Mail/Tag,
+      # unabhängig von run_id. restore-keys als Fallback auf den letzten Stand.
       - name: Restore sent-state cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/dashboard_sent_date.txt
-          key: dashboard-sent-${{ github.run_id }}
+          key: dashboard-sent-${{ steps.date.outputs.today }}
           restore-keys: |
             dashboard-sent-
 
+      # Garmin-Token: persistenter Prefix-Cache. Jeder Lauf speichert frisch,
+      # restore-keys holt zuverlässig den jüngsten Stand → kein Re-Login/MFA.
       - name: Restore Garmin token cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: /tmp/garmin_tokens
-          key: garmin-tokens-${{ github.run_id }}
+          key: garmin-tokens-${{ steps.date.outputs.today }}-${{ github.run_id }}
           restore-keys: |
             garmin-tokens-
 
@@ -55,14 +67,19 @@ jobs:
 
       - name: Run dashboard
         env:
-          GARMIN_EMAIL:       ${{ secrets.GARMIN_EMAIL }}
-          GARMIN_PASSWORD:    ${{ secrets.GARMIN_PASSWORD }}
-          GARM_TOKENS_DIR:    /tmp/garmin_tokens
-          CLAUDE_API_KEY:     ${{ secrets.CLAUDE_API_KEY }}
-          GMAIL_USER:         ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          GMAIL_TO:           ${{ secrets.GMAIL_TO }}
-          DASHBOARD_TZ:       Europe/Berlin
+          # Bevorzugt: einmalig lokal erzeugter garth-Token als Base64-Secret
+          # (umgeht MFA im CI komplett). Optional, aber dringend empfohlen.
+          GARMIN_TOKEN_BASE64: ${{ secrets.GARMIN_TOKEN_BASE64 }}
+          GARMIN_EMAIL:        ${{ secrets.GARMIN_EMAIL }}
+          GARMIN_PASSWORD:     ${{ secrets.GARMIN_PASSWORD }}
+          GARMIN_MFA:          ${{ secrets.GARMIN_MFA }}
+          GARM_TOKENS_DIR:     /tmp/garmin_tokens
+          CLAUDE_API_KEY:      ${{ secrets.CLAUDE_API_KEY }}
+          GMAIL_USER:          ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:  ${{ secrets.GMAIL_APP_PASSWORD }}
+          GMAIL_TO:            ${{ secrets.GMAIL_TO }}
+          DASHBOARD_TZ:        Europe/Berlin
+          FORCE_SEND:          ${{ github.event.inputs.force_send }}
         run: python garmin_daily.py
 
       - name: Save sent-state cache
@@ -70,11 +87,11 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: /tmp/dashboard_sent_date.txt
-          key: dashboard-sent-${{ github.run_id }}
+          key: dashboard-sent-${{ steps.date.outputs.today }}
 
       - name: Save Garmin token cache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: /tmp/garmin_tokens
-          key: garmin-tokens-${{ github.run_id }}
+          key: garmin-tokens-${{ steps.date.outputs.today }}-${{ github.run_id }}
