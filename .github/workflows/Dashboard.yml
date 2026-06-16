@@ -54,6 +54,17 @@ jobs:
           restore-keys: |
             garmin-tokens-
 
+      # Verlaufs-Historie für die Diagramme (VO2max-Trend, Schlaf/Belastung).
+      # Gleiches Prinzip wie der Token-Cache: jeder Lauf speichert frisch,
+      # restore-keys holt zuverlässig den jüngsten Stand.
+      - name: Restore history cache
+        uses: actions/cache/restore@v4
+        with:
+          path: /tmp/garmin_history.json
+          key: garmin-history-${{ steps.date.outputs.today }}-${{ github.run_id }}
+          restore-keys: |
+            garmin-history-
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -80,6 +91,9 @@ jobs:
           GMAIL_TO:            ${{ secrets.GMAIL_TO }}
           DASHBOARD_TZ:        Europe/Berlin
           FORCE_SEND:          ${{ github.event.inputs.force_send }}
+          # NEU: Verlaufs-Historie + VO2max-Ziel für die Diagramme
+          HISTORY_FILE:        /tmp/garmin_history.json
+          VO2MAX_GOAL:         "50"
         run: python garmin_daily.py
 
       - name: Save sent-state cache
@@ -95,3 +109,10 @@ jobs:
         with:
           path: /tmp/garmin_tokens
           key: garmin-tokens-${{ steps.date.outputs.today }}-${{ github.run_id }}
+
+      - name: Save history cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /tmp/garmin_history.json
+          key: garmin-history-${{ steps.date.outputs.today }}-${{ github.run_id }}
